@@ -134,6 +134,26 @@ function createMockSnapshot() {
   };
 }
 
+async function mockCDPCommandRuntimeEvaluate({ params: { expression, awaitPromise } }) {
+  try {
+    return {
+      success: true,
+      result: {
+        value: awaitPromise ? await eval(expression) : eval(expression)
+      }
+    };
+  } catch (exception) {
+    return {
+      success: false,
+      exceptionDetails: {
+        exception,
+        text: typeof exception === 'string' ? exception : exception?.message ?? 'Unknown JavaScript exception',
+        stackTrace: exception?.stack,
+      }
+    };
+  }
+}
+
 module.exports = {
   createMockServer,
   createMockTransport,
@@ -144,5 +164,6 @@ module.exports = {
   createMockBrowserList,
   createMockTabList,
   createMockNetworkRequest,
-  createMockSnapshot
+  createMockSnapshot,
+  mockCDPCommandRuntimeEvaluate
 };

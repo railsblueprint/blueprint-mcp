@@ -524,7 +524,8 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
           'Runtime.evaluate',
           {
             expression: expression,
-            returnByValue: true
+            returnByValue: cdpParams.returnByValue ?? true,
+            awaitPromise: cdpParams.awaitPromise
           }
         );
 

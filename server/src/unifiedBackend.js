@@ -312,8 +312,13 @@ class UnifiedBackend {
           type: 'object',
           properties: {
             function: { type: 'string', description: 'JavaScript function to execute' },
-            expression: { type: 'string', description: 'JavaScript expression to evaluate' }
-          }
+            expression: { type: 'string', description: 'JavaScript expression to evaluate' },
+            timeout: { type: 'integer', minimum: 0, description: 'Terminate execution after timing out (number of milliseconds)' }
+          },
+          oneOf: [
+            { required: ['function'] },
+            { required: ['expression'] }
+          ]
         }
       },
 
@@ -3589,13 +3594,28 @@ class UnifiedBackend {
 
   async _handleEvaluate(args, options = {}) {
     const expression = args.function || args.expression;
+    const timeout = args.timeout;
+
+    // It is better to use a wrapper than the standard `timeout` parameter 
+    // of the `Runtime.evaluate`, because when this parameter is enabled, 
+    // Chrome simply returns `undefined` without any warnings.
+    const withTimeout = (expression, timeout) => `
+      Promise.race([
+        (${expression}),
+        new Promise((_, reject) => setTimeout(() => reject('Rejected due to timeout (${timeout} ms).'), ${timeout}))
+      ])
+    `;
 
     // If expression looks like a function definition, wrap and call it
     // Match: () => ..., function() {...}, async () => ..., etc.
-    const isFunctionExpression = /^\s*(async\s+)?\([^)]*\)\s*=>|^\s*function\s*\(/.test(expression);
+    const isFunctionExpression = /^\s*(async\s*)?(\([^)]*\)|[_$a-z][_$a-z0-9]*)\s*=>|^\s*(async\s+)?function\s*([_$a-z][_$a-z0-9]*)?\s*(\s*\*?)\s*\(/i.test(expression);
     const finalExpression = (args.function || isFunctionExpression)
-      ? `(${expression})()`
-      : expression;
+      ? typeof timeout === 'number'
+        ? withTimeout(`(${expression})()`, timeout)
+        : `(${expression})()`
+      : typeof timeout === 'number'
+        ? withTimeout(expression, timeout)
+        : expression;
 
     const result = await this._transport.sendCommand('forwardCDPCommand', {
       method: 'Runtime.evaluate',
