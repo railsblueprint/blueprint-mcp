@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/railsblueprint-blueprint-mcp-badge.png)](https://mseep.ai/app/railsblueprint-blueprint-mcp)
+
 # Blueprint MCP
 
 > Control your real browser with AI through the Model Context Protocol
