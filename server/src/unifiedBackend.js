@@ -15,8 +15,11 @@ function debugLog(...args) {
 const NO_TAB_ATTACHED_TEXT = `No tab attached. Use \`browser_tabs action='attach'\` to attach a tab first.`;
 
 // Headers arrive in two shapes: CDP entries carry a name->value object,
-// webRequest entries carry an array of {name, value}. Normalize to the
-// object shape before rendering so both sources display their headers.
+// webRequest entries carry an array of {name, value} (or binaryValue for
+// non-UTF-8 bytes). Normalize to the object shape so every consumer —
+// rendered text, rawResult, replay — sees one format. Repeated headers
+// (multiple Set-Cookie) are joined per RFC 9110 list syntax rather than
+// collapsed last-wins.
 function normalizeHeaders(headers) {
   if (!headers) {
     return {};
@@ -24,9 +27,13 @@ function normalizeHeaders(headers) {
   if (Array.isArray(headers)) {
     const normalized = {};
     for (const header of headers) {
-      if (header && header.name !== undefined) {
-        normalized[header.name] = header.value ?? '';
+      if (!header || header.name === undefined) {
+        continue;
       }
+      const value = header.value ?? (header.binaryValue ? '<binary value>' : '');
+      normalized[header.name] = header.name in normalized
+        ? `${normalized[header.name]}, ${value}`
+        : value;
     }
     return normalized;
   }
@@ -4330,6 +4337,18 @@ class UnifiedBackend {
     }
 
     const requests = result.requests || [];
+
+    // Normalize header shapes once, so the rendered text, rawResult and
+    // replay consumers all see the same object format regardless of
+    // whether an entry came from the CDP or webRequest tracker
+    for (const req of requests) {
+      if (req.requestHeaders) {
+        req.requestHeaders = normalizeHeaders(req.requestHeaders);
+      }
+      if (req.responseHeaders) {
+        req.responseHeaders = normalizeHeaders(req.responseHeaders);
+      }
+    }
 
     if (requests.length === 0) {
       if (options.rawResult) {

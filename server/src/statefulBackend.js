@@ -894,12 +894,14 @@ class StatefulBackend {
     }
 
     // Close proxy connection if we're in proxy mode. Deliberately NO
-    // serverShuttingDown here: the relay multiplexes multiple MCP clients
-    // onto one extension, so the notification would force-detach every
-    // client's debugger sessions, not just this one's. Until the relay
-    // protocol carries client identity (mcp-57fb / mcp-d591), a PRO
-    // disable leaves the other clients' sessions untouched and this
-    // client's sessions to the extension's idle handling.
+    // serverShuttingDown here (MCPConnection.sendNotification is the
+    // intentionally-unused hook for it): the relay multiplexes multiple
+    // MCP clients onto one extension, so the notification would
+    // force-detach every client's debugger sessions, not just this one's.
+    // Known cost: this client's sessions and debug banners persist until
+    // the extension's relay connection drops or the browser restarts —
+    // there is currently no per-client release path. Fixing that needs
+    // client identity in the relay protocol (mcp-57fb / mcp-d591).
     if (this._proxyConnection) {
       await this._proxyConnection.close();
       this._proxyConnection = null;
