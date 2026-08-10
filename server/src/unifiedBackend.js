@@ -14,6 +14,25 @@ function debugLog(...args) {
 // One wording for the no-tab-attached state everywhere it is rendered
 const NO_TAB_ATTACHED_TEXT = `No tab attached. Use \`browser_tabs action='attach'\` to attach a tab first.`;
 
+// Headers arrive in two shapes: CDP entries carry a name->value object,
+// webRequest entries carry an array of {name, value}. Normalize to the
+// object shape before rendering so both sources display their headers.
+function normalizeHeaders(headers) {
+  if (!headers) {
+    return {};
+  }
+  if (Array.isArray(headers)) {
+    const normalized = {};
+    for (const header of headers) {
+      if (header && header.name !== undefined) {
+        normalized[header.name] = header.value ?? '';
+      }
+    }
+    return normalized;
+  }
+  return headers;
+}
+
 class UnifiedBackend {
   constructor(config, transport) {
     this._config = config;
@@ -4452,9 +4471,10 @@ class UnifiedBackend {
       let details = `### Request Details\n\n**${req.method} ${req.url}${type}**\nStatus: ${status}\nRequest ID: \`${requestId}\``;
 
       // Add request headers
-      if (req.requestHeaders && Object.keys(req.requestHeaders).length > 0) {
+      const requestHeaders = normalizeHeaders(req.requestHeaders);
+      if (Object.keys(requestHeaders).length > 0) {
         const importantHeaders = ['content-type', 'authorization', 'accept', 'user-agent', 'cookie'];
-        const headerLines = Object.entries(req.requestHeaders)
+        const headerLines = Object.entries(requestHeaders)
           .filter(([key]) => importantHeaders.includes(key.toLowerCase()))
           .map(([key, value]) => `  ${key}: ${value.length > 100 ? value.substring(0, 100) + '...' : value}`)
           .join('\n');
@@ -4512,9 +4532,10 @@ class UnifiedBackend {
       }
 
       // Add response headers
-      if (req.responseHeaders && Object.keys(req.responseHeaders).length > 0) {
+      const responseHeaders = normalizeHeaders(req.responseHeaders);
+      if (Object.keys(responseHeaders).length > 0) {
         const importantHeaders = ['content-type', 'content-length', 'cache-control', 'set-cookie'];
-        const headerLines = Object.entries(req.responseHeaders)
+        const headerLines = Object.entries(responseHeaders)
           .filter(([key]) => importantHeaders.includes(key.toLowerCase()))
           .map(([key, value]) => `  ${key}: ${value.length > 100 ? value.substring(0, 100) + '...' : value}`)
           .join('\n');

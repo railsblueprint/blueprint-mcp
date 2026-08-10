@@ -434,7 +434,9 @@ registerTabCleanup(chrome, {
 // timeouts. Captured data stays scoped per tab.
 async function ensureDebuggerAttached(attachedTabId) {
   if (!attachedTabId) {
-    throw new Error('No tab attached');
+    // Callers pass the guarded snapshot, so this is an internal bug signal
+    // rather than the user-facing no-tab condition
+    throw new Error('ensureDebuggerAttached called without a tab id');
   }
 
   let session = debuggerSessions.get(attachedTabId);
@@ -663,13 +665,14 @@ async function fetchRequestData(attachedTabId, method, params, requestId) {
 
 // Handle CDP commands from MCP server
 async function handleCDPCommand(cdpMethod, cdpParams) {
-  const attachedTabId = tabHandlers.getAttachedTabId();
+  // Single read: guard and snapshot in one call, so a tab attaching
+  // between a check and a later read can't let dispatch run with null.
+  // Target.getTargets is the only command that works without a tab.
+  const attachedTabId = cdpMethod === 'Target.getTargets'
+    ? tabHandlers.getAttachedTabId()
+    : tabHandlers.requireAttachedTabId();
 
   logger.log(`[Background] handleCDPCommand called: ${cdpMethod} tab: ${attachedTabId}`);
-
-  if (!attachedTabId && cdpMethod !== 'Target.getTargets') {
-    tabHandlers.requireAttachedTabId(); // Throws the standard guidance
-  }
 
   try {
     return await dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId);
@@ -1650,10 +1653,7 @@ async function dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId) {
     }
 
     case 'Runtime.getDialogEvents': {
-      const attachedTabId = tabHandlers.getAttachedTabId();
-      if (!attachedTabId) {
-        throw new Error('No tab attached');
-      }
+      // attachedTabId is the guarded snapshot from dispatch
       const events = await dialogHandler.getDialogEvents(attachedTabId);
       return { events };
     }
