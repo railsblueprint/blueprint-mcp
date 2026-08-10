@@ -70,6 +70,18 @@ export class TabHandlers {
   }
 
   /**
+   * Get the attached tab ID, throwing when no tab is attached. The single
+   * guard used by every tab-scoped command handler so the condition always
+   * surfaces through the JSON-RPC error channel with one message.
+   */
+  requireAttachedTabId() {
+    if (!this.attachedTabId) {
+      throw new Error("No tab attached. Use browser_tabs action='attach' to attach a tab first.");
+    }
+    return this.attachedTabId;
+  }
+
+  /**
    * Get stealth mode state
    */
   getStealthMode() {

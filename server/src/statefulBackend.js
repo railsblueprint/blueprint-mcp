@@ -893,16 +893,25 @@ class StatefulBackend {
       this._activeBackend = null;
     }
 
-    // Close proxy connection if we're in proxy mode
+    // Close proxy connection if we're in proxy mode. The extension stays
+    // connected to the relay after we leave, so tell it this is a
+    // deliberate disable — otherwise its debugger sessions (and the
+    // "being debugged" banners) would persist indefinitely.
     if (this._proxyConnection) {
+      try {
+        this._proxyConnection.sendNotification('serverShuttingDown', {});
+      } catch (error) {
+        debugLog('[StatefulBackend] Could not notify extension of shutdown:', error.message);
+      }
       await this._proxyConnection.close();
       this._proxyConnection = null;
     }
 
-    // Stop extension server if in direct mode
+    // Stop extension server if in direct mode. This is a deliberate
+    // disable, so the extension is told to drop debugger attachments now
     if (this._extensionServer) {
       debugLog('[StatefulBackend] Stopping ExtensionServer...');
-      await this._extensionServer.stop();
+      await this._extensionServer.stop({ notifyShutdown: true });
       this._extensionServer = null;
       debugLog('[StatefulBackend] ExtensionServer stopped');
     }

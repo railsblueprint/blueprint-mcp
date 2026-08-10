@@ -286,10 +286,25 @@ class ExtensionServer {
   /**
    * Stop the server
    */
-  async stop() {
+  async stop({ notifyShutdown = false } = {}) {
     debugLog('Stopping server');
 
     if (this._extensionWs) {
+      // Only a deliberate disable tells the extension to release debugger
+      // attachments immediately. Process shutdown (SIGINT, client restart)
+      // must NOT: the server usually comes right back, and the extension's
+      // grace period exists to preserve sessions across exactly that.
+      if (notifyShutdown) {
+        try {
+          this._extensionWs.send(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'serverShuttingDown',
+            params: {}
+          }));
+        } catch {
+          // Socket may already be closing; the grace sweep covers this case
+        }
+      }
       this._extensionWs.close();
       this._extensionWs = null;
     }

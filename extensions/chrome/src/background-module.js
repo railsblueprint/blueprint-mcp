@@ -12,6 +12,7 @@ import { IconManager } from '../../shared/utils/icons.js';
 import { WebSocketConnection } from '../../shared/connection/websocket.js';
 import { TabHandlers } from '../../shared/handlers/tabs.js';
 import { NetworkTracker } from '../../shared/handlers/network.js';
+import { registerCaptureCommandHandlers, registerTabCleanup } from '../../shared/handlers/captureCommands.js';
 import { DialogHandler } from '../../shared/handlers/dialogs.js';
 import { ConsoleHandler } from '../../shared/handlers/console.js';
 import { createBrowserAdapter } from '../../shared/adapters/browser.js';
@@ -151,6 +152,10 @@ tabHandlers.setConsoleInjector((tabId) => consoleHandler.injectConsoleCapture(ta
 tabHandlers.setDialogInjector((tabId) => dialogHandler.setupDialogOverrides(tabId));
 
 // Set up console message listener (receives messages from content script)
+// Note: a debugger-attached tab is captured by BOTH the content-script path
+// and CDP Runtime events, so some messages appear twice. This duplication
+// predates this branch (reconciling the two streams reliably is not
+// possible message-by-message) and is tracked in mcp-071f.
 consoleHandler.setupMessageListener();
 
 // Initialize icon manager
@@ -162,12 +167,25 @@ networkTracker.init();
 // State variables
 let techStackInfo = {}; // Stores detected tech stack per tab
 // let pendingDialogResponse = null; // Stores response for next dialog (unused - removed)
-let debuggerAttached = false; // Track if debugger is attached to current tab
-let currentDebuggerTabId = null; // Track which tab has debugger attached
 
-// CDP Network tracking storage
-const cdpNetworkRequests = new Map(); // Stores CDP network requests by requestId
-const MAX_CDP_REQUESTS = 500; // Keep only last 500 requests
+// Debugger attachments are kept per tab: switching tabs no longer detaches the
+// previous tab's debugger, which caused CDP command timeouts. Each entry's
+// promise resolves once attach + domain enables complete; concurrent commands
+// for the same tab share it instead of racing chrome.debugger.attach.
+const debuggerSessions = new Map(); // tabId -> { promise, lastUsed, networkEnabled, runtimeEnabled }
+const pendingDetaches = new Map(); // tabId -> in-flight detach promise
+const MAX_ATTACHED_TABS = 5; // Least-recently-used tabs beyond this are detached
+const EVICTION_MIN_IDLE_MS = 30000; // Never evict a session used this recently
+
+// CDP network capture, bucketed per tab so one tab's traffic cannot leak into
+// or evict another tab's entries
+const cdpNetworkRequests = new Map(); // tabId -> Map of requests by requestId
+const MAX_CDP_REQUESTS = 500; // Per-tab cap on stored requests
+
+// Grace period before a lost server connection releases debugger sessions:
+// transient disconnects (server hot reload, relay blip) auto-reconnect
+// within seconds and must not destroy live sessions and captured data
+const DEBUGGER_DETACH_GRACE_MS = 60000;
 
 // Set up keepalive alarm (Chrome-specific - prevents service worker suspension)
 if (chrome.alarms) {
@@ -175,6 +193,21 @@ if (chrome.alarms) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'keepalive') {
       logger.log('[Background] Keepalive alarm - service worker active');
+
+      // Periodic grace sweep: release debuggers once no session has been
+      // established for the whole grace period. An alarm-driven recheck
+      // cannot be starved or reset by reconnect attempts or flapping
+      // connections — the only thing that keeps sessions alive is an
+      // actually established connection within the window.
+      // isSessionDown flips atomically with lastConnectedAt, so a socket
+      // error observed between its error and close events cannot make the
+      // sweep skip the grace period.
+      if (wsConnection && wsConnection.isSessionDown() &&
+          debuggerSessions.size > 0 &&
+          Date.now() - wsConnection.lastConnectedAt > DEBUGGER_DETACH_GRACE_MS) {
+        logger.log('[Background] No server connection for over a minute; detaching debuggers');
+        detachAllDebuggers();
+      }
     }
   });
 }
@@ -184,8 +217,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   // Only track Network and Runtime events
   if (!method.startsWith('Network.') && !method.startsWith('Runtime.')) return;
 
-  // Only track events for the currently attached tab
-  if (!currentDebuggerTabId || source.tabId !== currentDebuggerTabId) return;
+  // Only track events for tabs with debugger attached
+  if (!debuggerSessions.has(source.tabId)) return;
 
   try {
     switch (method) {
@@ -194,19 +227,28 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         const request = params.request;
         const type = params.type || 'other';
 
-        cdpNetworkRequests.set(requestId, {
+        let tabRequests = cdpNetworkRequests.get(source.tabId);
+        if (!tabRequests) {
+          tabRequests = new Map();
+          cdpNetworkRequests.set(source.tabId, tabRequests);
+        }
+
+        tabRequests.set(requestId, {
           requestId,
           url: request.url,
           method: request.method,
           requestHeaders: request.headers,
           type,
-          timestamp: params.timestamp || Date.now() / 1000
+          // params.timestamp is MonotonicTime (seconds since browser
+          // start); wallTime is epoch seconds — the epoch-ms value is what
+          // the server renders with new Date()
+          timestamp: params.wallTime ? params.wallTime * 1000 : Date.now()
         });
 
         // Limit storage size
-        if (cdpNetworkRequests.size > MAX_CDP_REQUESTS) {
-          const firstKey = cdpNetworkRequests.keys().next().value;
-          cdpNetworkRequests.delete(firstKey);
+        if (tabRequests.size > MAX_CDP_REQUESTS) {
+          const firstKey = tabRequests.keys().next().value;
+          tabRequests.delete(firstKey);
         }
         break;
       }
@@ -215,7 +257,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         const requestId = params.requestId;
         const response = params.response;
 
-        const existing = cdpNetworkRequests.get(requestId);
+        const existing = cdpNetworkRequests.get(source.tabId)?.get(requestId);
         if (existing) {
           existing.statusCode = response.status;
           existing.statusText = response.statusText;
@@ -227,7 +269,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
       case 'Network.loadingFinished': {
         const requestId = params.requestId;
-        const existing = cdpNetworkRequests.get(requestId);
+        const existing = cdpNetworkRequests.get(source.tabId)?.get(requestId);
         if (existing) {
           existing.finished = true;
           existing.encodedDataLength = params.encodedDataLength;
@@ -237,7 +279,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
       case 'Network.loadingFailed': {
         const requestId = params.requestId;
-        const existing = cdpNetworkRequests.get(requestId);
+        const existing = cdpNetworkRequests.get(source.tabId)?.get(requestId);
         if (existing) {
           existing.failed = true;
           existing.errorText = params.errorText;
@@ -249,6 +291,13 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         // Capture ALL console messages (page + extensions) via CDP
         const level = params.type; // 'log', 'warning', 'error', 'info', 'debug', etc
         const args = params.args || [];
+
+        // CDP timestamps are epoch milliseconds. Note that Runtime.enable
+        // replays the tab's buffered events into each new session (they
+        // arrive before the enable response, so they cannot be reliably
+        // distinguished from live events here); replay duplication across
+        // re-attaches is a known limitation tracked in mcp-071f.
+        const eventTime = params.timestamp || Date.now();
 
         // Convert CDP RemoteObject arguments to strings
         const text = args.map(arg => {
@@ -267,7 +316,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           tabId: source.tabId,
           level: level === 'warning' ? 'warn' : level, // Normalize 'warning' to 'warn'
           text: text,
-          timestamp: Date.now(),
+          timestamp: eventTime,
           url: params.stackTrace?.callFrames?.[0]?.url || 'unknown'
         });
         break;
@@ -350,75 +399,265 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Initialize WebSocket connection
 wsConnection = new WebSocketConnection(chrome, logger, iconManager, buildTimestamp);
 
-// Listen for debugger detach events to keep state in sync
+// Deliberate server shutdown (the disable tool): release debuggers
+// immediately instead of waiting out the transient-disconnect grace
+wsConnection.registerNotificationHandler('serverShuttingDown', async () => {
+  logger.log('[Background] Server shutting down; detaching debuggers');
+  detachAllDebuggers(true);
+});
+
+// Listen for debugger detach events to keep state in sync. Does not fire for
+// the extension's own detach() calls, only for external detaches (user
+// closing the debug banner, tab closed, devtools attaching).
 chrome.debugger.onDetach.addListener((source, reason) => {
   logger.log(`[Background] Debugger detached from tab ${source.tabId}, reason: ${reason}`);
+  debuggerSessions.delete(source.tabId);
+  cdpNetworkRequests.delete(source.tabId);
+});
 
-  // Reset debugger state if it was detached from the current tab
-  if (source.tabId === currentDebuggerTabId) {
-    debuggerAttached = false;
-    currentDebuggerTabId = null;
-    logger.log('[Background] Debugger state reset');
+// Tab-close cleanup is shared across browsers; Chrome adds its CDP stores
+registerTabCleanup(chrome, {
+  tabHandlers,
+  networkTracker,
+  consoleHandler,
+  techStackInfo,
+  logger,
+  extraCleanup: (tabId) => {
+    cdpNetworkRequests.delete(tabId);
   }
 });
 
-// Helper function to ensure debugger is attached to current tab
-async function ensureDebuggerAttached() {
-  const attachedTabId = tabHandlers.getAttachedTabId();
-
+// Ensure a debugger is attached to the given tab (the caller's snapshot of
+// the attached tab, so a concurrent tab switch can't attach one tab while
+// the command targets another). Attachments to other tabs are kept (up to
+// MAX_ATTACHED_TABS): detaching on every tab switch caused CDP command
+// timeouts. Captured data stays scoped per tab.
+async function ensureDebuggerAttached(attachedTabId) {
   if (!attachedTabId) {
     throw new Error('No tab attached');
   }
 
-  // If debugger is already attached to this tab, we're good
-  if (debuggerAttached && currentDebuggerTabId === attachedTabId) {
-    return;
-  }
-
-  // Detach from previous tab if needed
-  if (debuggerAttached && currentDebuggerTabId) {
-    try {
-      await chrome.debugger.detach({ tabId: currentDebuggerTabId });
-      logger.log(`[Background] Detached debugger from tab ${currentDebuggerTabId}`);
-    } catch (e) {
-      logger.log(`[Background] Failed to detach debugger: ${e.message}`);
+  let session = debuggerSessions.get(attachedTabId);
+  if (!session) {
+    // A detach for this tab may still be in flight; attaching before it
+    // completes would fail with "already attached" and lose the session
+    const pendingDetach = pendingDetaches.get(attachedTabId);
+    if (pendingDetach) {
+      await pendingDetach;
+      session = debuggerSessions.get(attachedTabId);
     }
   }
+  if (!session) {
+    session = {
+      promise: null,
+      lastUsed: Date.now(),
+      networkEnabled: false,
+      runtimeEnabled: false
+    };
+    session.promise = attachDebugger(attachedTabId, session);
+    debuggerSessions.set(attachedTabId, session);
+    // Drop the entry on attach failure so a later command can retry
+    session.promise.catch(() => {
+      if (debuggerSessions.get(attachedTabId) === session) {
+        debuggerSessions.delete(attachedTabId);
+      }
+    });
+  }
+  session.lastUsed = Date.now();
+  await session.promise;
 
-  // Attach to new tab
+  // Domain enables can fail transiently (e.g. mid-navigation) without
+  // failing the attach — tools like screenshots must still work. Retry
+  // missing enables on each command so capture recovers instead of staying
+  // dead for the session's lifetime.
+  if (!session.networkEnabled || !session.runtimeEnabled) {
+    await enableCaptureDomains(attachedTabId, session);
+  }
+
+  // Enforce the session cap here too, not only at attach time: sessions
+  // that were all busy at attach time become evictable as they go idle
+  evictLeastRecentlyUsedSessions(attachedTabId);
+}
+
+async function attachDebugger(tabId, session) {
   try {
-    await chrome.debugger.attach({ tabId: attachedTabId }, '1.3');
-    debuggerAttached = true;
-    currentDebuggerTabId = attachedTabId;
-    logger.log(`[Background] Attached debugger to tab ${attachedTabId}`);
-
-    // Enable Network domain for CDP network tracking
-    try {
-      await chrome.debugger.sendCommand(
-        { tabId: attachedTabId },
-        'Network.enable',
-        {}
-      );
-      logger.log(`[Background] Enabled Network domain for tab ${attachedTabId}`);
-    } catch (netError) {
-      logger.log(`[Background] Warning: Could not enable Network domain: ${netError.message}`);
-    }
-
-    // Enable Runtime domain for console message capture (captures ALL console logs including extensions!)
-    try {
-      await chrome.debugger.sendCommand(
-        { tabId: attachedTabId },
-        'Runtime.enable',
-        {}
-      );
-      logger.log(`[Background] Enabled Runtime domain for console capture on tab ${attachedTabId}`);
-    } catch (runtimeError) {
-      logger.log(`[Background] Warning: Could not enable Runtime domain: ${runtimeError.message}`);
-    }
+    await chrome.debugger.attach({ tabId }, '1.3');
+    logger.log(`[Background] Attached debugger to tab ${tabId} (${debuggerSessions.size} total tabs)`);
   } catch (error) {
-    debuggerAttached = false;
-    currentDebuggerTabId = null;
     throw new Error(`Failed to attach debugger: ${error.message}`);
+  }
+
+  await enableCaptureDomains(tabId, session);
+}
+
+// Enable the CDP domains used for capture, tolerating failures: attach
+// stays usable for other commands and the enables are retried by
+// ensureDebuggerAttached on the next command. The two enables are
+// independent round trips, so they run in parallel.
+async function enableCaptureDomains(tabId, session) {
+  const enables = [];
+
+  if (!session.networkEnabled) {
+    enables.push((async () => {
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+        session.networkEnabled = true;
+        logger.log(`[Background] Enabled Network domain for tab ${tabId}`);
+      } catch (netError) {
+        logger.log(`[Background] Warning: Could not enable Network domain: ${netError.message}`);
+      }
+    })());
+  }
+
+  if (!session.runtimeEnabled) {
+    enables.push((async () => {
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {});
+        session.runtimeEnabled = true;
+        logger.log(`[Background] Enabled Runtime domain for console capture on tab ${tabId}`);
+      } catch (runtimeError) {
+        logger.log(`[Background] Warning: Could not enable Runtime domain: ${runtimeError.message}`);
+      }
+    })());
+  }
+
+  await Promise.all(enables);
+}
+
+// Keep roughly MAX_ATTACHED_TABS live debugger sessions: each one streams
+// Network/Runtime events into the service worker and shows a "being
+// debugged" banner, so accumulation over many tabs is unbounded otherwise.
+// Sessions used within EVICTION_MIN_IDLE_MS are never evicted (a recently
+// active session likely has commands in flight, and evicting it would
+// thrash). The cap may be exceeded while all sessions are busy; because
+// this runs on every command (see ensureDebuggerAttached), the overshoot
+// shrinks again as sessions go idle.
+// Accepted tradeoff: a single command running longer than the idle window
+// on a tab that is no longer the attached target can have its session
+// evicted mid-command (the command fails with "Detached while handling
+// command" and retries cleanly). Tracking per-command pins proved more
+// error-prone than this window (see history in the PR).
+let evictionRetryTimer = null;
+
+function evictLeastRecentlyUsedSessions(protectedTabId) {
+  while (debuggerSessions.size > MAX_ATTACHED_TABS) {
+    const now = Date.now();
+    let oldestTabId = null;
+    let oldestUsed = Infinity;
+    const currentTabId = tabHandlers.getAttachedTabId();
+    for (const [tabId, session] of debuggerSessions) {
+      if (tabId === protectedTabId) continue;
+      if (tabId === currentTabId) continue; // Never evict the active target
+      if (now - session.lastUsed < EVICTION_MIN_IDLE_MS) continue;
+      if (session.lastUsed < oldestUsed) {
+        oldestUsed = session.lastUsed;
+        oldestTabId = tabId;
+      }
+    }
+    if (oldestTabId === null) break;
+    detachDebugger(oldestTabId);
+  }
+
+  // Every session was too recently used to evict (e.g. a burst attached
+  // many tabs at once): retry once they can be idle, so the overshoot
+  // shrinks even if no further command arrives. The timer survives MV3
+  // suspension concerns because live debugger sessions pin the worker.
+  if (debuggerSessions.size > MAX_ATTACHED_TABS && !evictionRetryTimer) {
+    evictionRetryTimer = setTimeout(() => {
+      evictionRetryTimer = null;
+      evictLeastRecentlyUsedSessions();
+    }, EVICTION_MIN_IDLE_MS + 1000);
+  }
+}
+
+// Detach one tab's debugger. Bookkeeping is removed synchronously; the
+// pending detach is tracked so ensureDebuggerAttached serializes a
+// re-attach behind it instead of racing chrome.debugger.attach.
+function detachDebugger(tabId) {
+  const session = debuggerSessions.get(tabId);
+  debuggerSessions.delete(tabId);
+  // Captured CDP entries die with the session: their requestIds are only
+  // usable on the session that captured them. The listing falls back to
+  // the webRequest tracker, which holds the same traffic — headers
+  // included — and keeps capturing after the detach.
+  cdpNetworkRequests.delete(tabId);
+
+  const detachPromise = (async () => {
+    if (session) {
+      // Wait out an in-flight attach: detaching mid-attach would leave a
+      // live debugger that no bookkeeping knows about
+      try {
+        await session.promise;
+      } catch {
+        return; // Attach failed, nothing to detach
+      }
+    }
+    try {
+      await chrome.debugger.detach({ tabId });
+      logger.log(`[Background] Detached debugger from tab ${tabId}`);
+    } catch {
+      // Tab may already be closed or debugger already detached
+    }
+  })();
+
+  const tracked = detachPromise.finally(() => {
+    if (pendingDetaches.get(tabId) === tracked) {
+      pendingDetaches.delete(tabId);
+    }
+  });
+  pendingDetaches.set(tabId, tracked);
+  return tracked;
+}
+
+// Detach all debuggers. Called when the connection to the MCP server stays
+// down past the grace period: with no client connected nothing consumes CDP
+// events, and leaving debuggers attached keeps the "is being debugged"
+// banner on every tab and streams events into the service worker forever.
+// Debuggers reattach lazily on the next CDP command after reconnect.
+// force: detach even while connected — used by deliberate-shutdown paths,
+// where the notification arrives before the socket actually closes
+async function detachAllDebuggers(force = false) {
+  const tabIds = Array.from(debuggerSessions.keys());
+  for (const tabId of tabIds) {
+    if (!force && wsConnection && wsConnection.isConnected) {
+      return; // Reconnected mid-sweep; the new connection keeps its sessions
+    }
+    await detachDebugger(tabId);
+  }
+}
+
+// Bodies are fetchable only for requests in the attached tab's live CDP
+// capture. Everything else — other tabs' requests, webRequest-tracked
+// entries (which listings may include for pre-attach history), cleared or
+// evicted entries — is uniformly refused before any attach happens. One
+// rule covers isolation (never rests on CDP requestId behavior), cleared
+// data staying cleared, and never paying a debug banner for a doomed
+// fetch. Surfacing body availability per entry in listings is tracked in
+// mcp-e2d9.
+function bodyFetchDenial(requestId, attachedTabId) {
+  if (cdpNetworkRequests.get(attachedTabId)?.has(requestId)) {
+    return null;
+  }
+  const webRequestEntry = networkTracker.getRequestsForTab(attachedTabId)
+    .some(r => r.requestId === requestId);
+  const reason = webRequestEntry
+    ? 'it was tracked via webRequest without a debugger session capturing when it ran, so no body was recorded'
+    : "it is not in the attached tab's current debugger capture (it may have been captured on another tab, cleared, or evicted)";
+  return {
+    error: `Response body is not available for request ${requestId}: ${reason}. Bodies exist only for requests captured by the attached tab's debugger session.`
+  };
+}
+
+// Fetch response data through the attached tab's debugger session, wrapping
+// CDP failures (e.g. entries expired from the session's buffer) in a
+// message that explains the session scoping
+async function fetchRequestData(attachedTabId, method, params, requestId) {
+  try {
+    return await chrome.debugger.sendCommand({ tabId: attachedTabId }, method, params);
+  } catch (error) {
+    return {
+      error: `Response data for request ${requestId} is not available from the attached tab's session (${error.message}). Bodies can only be fetched for requests captured on the attached tab while its debugger session is live.`
+    };
   }
 }
 
@@ -429,9 +668,26 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
   logger.log(`[Background] handleCDPCommand called: ${cdpMethod} tab: ${attachedTabId}`);
 
   if (!attachedTabId && cdpMethod !== 'Target.getTargets') {
-    throw new Error('No tab attached. Call selectTab or createTab first.');
+    tabHandlers.requireAttachedTabId(); // Throws the standard guidance
   }
 
+  try {
+    return await dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId);
+  } finally {
+    // Refresh the idle clock when the command ENDS: together with
+    // EVICTION_MIN_IDLE_MS this keeps LRU eviction away from sessions
+    // whose commands recently ran (or are still running, having bumped
+    // lastUsed at the start via ensureDebuggerAttached)
+    if (attachedTabId) {
+      const session = debuggerSessions.get(attachedTabId);
+      if (session) {
+        session.lastUsed = Date.now();
+      }
+    }
+  }
+}
+
+async function dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId) {
   switch (cdpMethod) {
     case 'Target.getTargets':
       return await tabHandlers.getTabs();
@@ -517,7 +773,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
         // Use Chrome Debugger Protocol for evaluation (like old TypeScript extension)
         // This provides better isolation and passes mainWorldExecution bot detection test
-        await ensureDebuggerAttached();
+        await ensureDebuggerAttached(attachedTabId);
 
         const result = await chrome.debugger.sendCommand(
           { tabId: attachedTabId },
@@ -564,7 +820,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'Input.dispatchKeyEvent': {
       // Use Chrome debugger for real trusted key events (enables form submission, etc.)
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
       try {
         await chrome.debugger.sendCommand(
           { tabId: attachedTabId },
@@ -584,7 +840,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
       const nodeId = cdpParams.nodeId || 1; // Default to document root
 
       try {
-        await ensureDebuggerAttached();
+        await ensureDebuggerAttached(attachedTabId);
 
         // Query selector using real Chrome debugger
         const result = await chrome.debugger.sendCommand(
@@ -601,7 +857,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'DOM.enable': {
       // Enable DOM domain in Chrome debugger
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       try {
         await chrome.debugger.sendCommand(
@@ -618,7 +874,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'CSS.enable': {
       // Enable CSS domain in Chrome debugger
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       try {
         await chrome.debugger.sendCommand(
@@ -635,7 +891,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'CSS.getMatchedStylesForNode': {
       // Get matched CSS styles for a node
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       const selector = cdpParams.selector;
       const pseudoState = cdpParams.pseudoState || [];
@@ -766,7 +1022,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'Network.enable': {
       // Enable Network domain in Chrome debugger
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       try {
         await chrome.debugger.sendCommand(
@@ -782,40 +1038,41 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
     }
 
     case 'Network.getResponseBody': {
-      // Get response body for a network request
-      await ensureDebuggerAttached();
-
-      try {
-        const result = await chrome.debugger.sendCommand(
-          { tabId: attachedTabId },
-          'Network.getResponseBody',
-          { requestId: cdpParams.requestId }
-        );
-        return result;
-      } catch (error) {
-        return { error: error.message };
+      // Get response body for a network request; refusals are decided
+      // before attaching so a doomed fetch never triggers an attach
+      const denial = bodyFetchDenial(cdpParams.requestId, attachedTabId);
+      if (denial) {
+        return denial;
       }
+      await ensureDebuggerAttached(attachedTabId);
+      return fetchRequestData(
+        attachedTabId,
+        'Network.getResponseBody',
+        { requestId: cdpParams.requestId },
+        cdpParams.requestId
+      );
     }
 
     case 'Network.getRequestPostData': {
-      // Get POST data for a network request
-      await ensureDebuggerAttached();
-
-      try {
-        const result = await chrome.debugger.sendCommand(
-          { tabId: attachedTabId },
-          'Network.getRequestPostData',
-          { requestId: cdpParams.requestId }
-        );
-        return { postData: result.postData };
-      } catch (error) {
-        return { error: error.message };
+      // Get POST data for a network request; same layering as
+      // Network.getResponseBody
+      const denial = bodyFetchDenial(cdpParams.requestId, attachedTabId);
+      if (denial) {
+        return denial;
       }
+      await ensureDebuggerAttached(attachedTabId);
+      const result = await fetchRequestData(
+        attachedTabId,
+        'Network.getRequestPostData',
+        { requestId: cdpParams.requestId },
+        cdpParams.requestId
+      );
+      return result.error ? result : { postData: result.postData };
     }
 
     case 'Fetch.enable': {
       // Enable Fetch domain in Chrome debugger for request interception
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       try {
         await chrome.debugger.sendCommand(
@@ -831,7 +1088,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'Fetch.disable': {
       // Disable Fetch domain in Chrome debugger
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       try {
         await chrome.debugger.sendCommand(
@@ -847,7 +1104,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'DOM.getDocument': {
       // Get real document from Chrome debugger
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       try {
         const result = await chrome.debugger.sendCommand(
@@ -863,7 +1120,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'CSS.forcePseudoState': {
       // Force pseudo-state on element using CDP
-      await ensureDebuggerAttached();
+      await ensureDebuggerAttached(attachedTabId);
 
       const params = {
         nodeId: cdpParams.nodeId,
@@ -891,7 +1148,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
       try {
         // Use Chrome Debugger Protocol for screenshots (works on non-visible tabs!)
-        await ensureDebuggerAttached();
+        await ensureDebuggerAttached(attachedTabId);
 
         let finalClip = null;
 
@@ -1293,37 +1550,12 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
       return { success: true };
     }
 
-    case 'Runtime.getConsoleMessages':
-      return { messages: consoleHandler.getMessages() };
-
-    case 'Network.getRequestLog': {
-      const limit = cdpParams.limit || 20;
-      const offset = cdpParams.offset || 0;
-      const urlPattern = cdpParams.urlPattern;
-      const method = cdpParams.method;
-      const status = cdpParams.status;
-      const resourceType = cdpParams.resourceType;
-
-      return networkTracker.getRequests({
-        limit,
-        offset,
-        urlPattern,
-        method,
-        status,
-        resourceType
-      });
-    }
-
-    case 'Network.getRequestDetails': {
-      const requestId = cdpParams.requestId;
-      const jsonPath = cdpParams.jsonPath;
-
-      return networkTracker.getRequestDetails(requestId, jsonPath);
-    }
-
-    case 'Network.clearRequestLog':
-      networkTracker.clear();
-      return { success: true };
+    // Note: the former pseudo-CDP cases Runtime.getConsoleMessages,
+    // Network.getRequestLog, Network.getRequestDetails and
+    // Network.clearRequestLog were removed — nothing sends them (the
+    // server uses the getConsoleMessages / getNetworkRequests /
+    // clearTracking commands) and they duplicated server-side filtering
+    // with divergent semantics.
 
     case 'Browser.getVersion':
       return {
@@ -1350,7 +1582,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'Page.printToPDF': {
       try {
-        await ensureDebuggerAttached();
+        await ensureDebuggerAttached(attachedTabId);
         const result = await chrome.debugger.sendCommand(
           { tabId: attachedTabId },
           'Page.printToPDF',
@@ -1405,7 +1637,7 @@ async function handleCDPCommand(cdpMethod, cdpParams) {
 
     case 'Performance.getMetrics': {
       try {
-        await ensureDebuggerAttached();
+        await ensureDebuggerAttached(attachedTabId);
         const result = await chrome.debugger.sendCommand(
           { tabId: attachedTabId },
           'Performance.getMetrics',
@@ -1735,37 +1967,28 @@ wsConnection.registerCommandHandler('reloadExtensions', async (params) => {
   };
 });
 
-wsConnection.registerCommandHandler('getNetworkRequests', async () => {
-  // Try CDP-tracked requests first (with proper requestIds for getResponseBody)
-  const cdpRequests = Array.from(cdpNetworkRequests.values());
-
-  // Fallback to webRequest tracker if no CDP requests
-  if (cdpRequests.length === 0) {
-    logger.log('[Background] No CDP requests, falling back to webRequest tracker');
-    return { requests: networkTracker.getRequests() };
+// Network/console read+clear handlers are shared across browsers; Chrome
+// adds the CDP capture as the preferred request source
+registerCaptureCommandHandlers(wsConnection, {
+  tabHandlers,
+  networkTracker,
+  consoleHandler,
+  logger,
+  getCdpRequestsForTab: (tabId) => {
+    const tabRequests = cdpNetworkRequests.get(tabId);
+    return tabRequests ? Array.from(tabRequests.values()) : [];
+  },
+  clearCdpRequestsForTab: (tabId) => {
+    cdpNetworkRequests.delete(tabId);
   }
-
-  return { requests: cdpRequests };
-});
-
-wsConnection.registerCommandHandler('clearTracking', async () => {
-  // Clear both CDP and webRequest trackers
-  cdpNetworkRequests.clear();
-  networkTracker.clearRequests();
-  return { success: true };
 });
 
 wsConnection.registerCommandHandler('getResponseBody', async ({ requestId }) => {
-  const attachedTabId = tabHandlers.getAttachedTabId();
-  if (!attachedTabId) {
-    return { error: 'No tab attached' };
-  }
+  tabHandlers.requireAttachedTabId();
 
   try {
-    // Ensure Network domain is enabled
-    await handleCDPCommand('Network.enable', {});
-
-    // Get response body via CDP
+    // The CDP case checks availability first and attaches only when the
+    // request is servable, so no eager Network.enable here
     const result = await handleCDPCommand('Network.getResponseBody', { requestId });
     return result;
   } catch (error) {
@@ -1774,33 +1997,14 @@ wsConnection.registerCommandHandler('getResponseBody', async ({ requestId }) => 
 });
 
 wsConnection.registerCommandHandler('getRequestPostData', async ({ requestId }) => {
-  const attachedTabId = tabHandlers.getAttachedTabId();
-  if (!attachedTabId) {
-    return { error: 'No tab attached' };
-  }
+  tabHandlers.requireAttachedTabId();
 
   try {
-    // Ensure Network domain is enabled
-    await handleCDPCommand('Network.enable', {});
-
-    // Get POST data via CDP
     const result = await handleCDPCommand('Network.getRequestPostData', { requestId });
     return result;
   } catch (error) {
     return { error: error.message };
   }
-});
-
-wsConnection.registerCommandHandler('getConsoleMessages', async () => {
-  // Only return messages from the currently attached tab
-  const attachedTabId = tabHandlers.getAttachedTabId();
-  const messages = attachedTabId ? consoleHandler.getMessages(attachedTabId) : [];
-  return { messages };
-});
-
-wsConnection.registerCommandHandler('clearConsoleMessages', async () => {
-  consoleHandler.clearMessages();
-  return { success: true };
 });
 
 wsConnection.registerCommandHandler('listExtensions', async () => {
@@ -1848,6 +2052,10 @@ chrome.storage.onChanged.addListener(async (changes, areaName) => {
       // Disconnect
       logger.logAlways('[Background] Disconnecting from MCP server...');
       wsConnection.disconnect();
+
+      // Explicit disable: drop the debug banners immediately instead of
+      // letting them linger for the transient-disconnect grace period
+      detachAllDebuggers(true);
     }
   }
 });

@@ -11,6 +11,9 @@ function debugLog(...args) {
   }
 }
 
+// One wording for the no-tab-attached state everywhere it is rendered
+const NO_TAB_ATTACHED_TEXT = `No tab attached. Use \`browser_tabs action='attach'\` to attach a tab first.`;
+
 class UnifiedBackend {
   constructor(config, transport) {
     this._config = config;
@@ -88,6 +91,30 @@ class UnifiedBackend {
       debugLog('Auto-reconnect failed:', error.message);
       return false;
     }
+  }
+
+  /**
+   * Render the no-tab-attached state for a capture-read tool. Every such
+   * tool must route through here so "no tab attached" is never rendered as
+   * "no data captured".
+   * @param {string} heading - Markdown heading for the text response
+   * @param {object} options - Tool options (rawResult support)
+   * @param {object} rawShape - Extra fields for the rawResult success shape
+   * @param {boolean} isError - Whether this state fails the specific call
+   */
+  _renderNoTabAttached(heading, options, rawShape = {}, isError = false) {
+    if (options.rawResult) {
+      return isError
+        ? { success: false, error: 'no_tab_attached', message: NO_TAB_ATTACHED_TEXT, ...rawShape }
+        : { success: true, noTabAttached: true, ...rawShape };
+    }
+    return {
+      content: [{
+        type: 'text',
+        text: `### ${heading}\n\n${NO_TAB_ATTACHED_TEXT}`
+      }],
+      isError
+    };
   }
 
   /**
@@ -729,6 +756,23 @@ class UnifiedBackend {
       debugLog(`Error in ${name}:`, error);
 
       const errorMsg = error.message || String(error);
+
+      // Script-mode (rawResult) consumers read structured fields, not
+      // content arrays: machine code in `error`, prose in `message`,
+      // matching the shapes statefulBackend already uses. Known conditions
+      // keep their specific codes so callers can branch on them.
+      // Note: the no-tab classification string-matches the message the
+      // extension throws; carrying structured codes in the JSON-RPC error
+      // payload instead is tracked in mcp-e2d9.
+      if (options.rawResult) {
+        let code = 'extension_error';
+        if (errorMsg.startsWith('No tab attached')) {
+          code = 'no_tab_attached';
+        } else if (this._statefulBackend && this._statefulBackend._browserDisconnected) {
+          code = 'browser_disconnected';
+        }
+        return { success: false, error: code, message: errorMsg };
+      }
 
       // Check if browser disconnected (PRO mode only)
       if (this._statefulBackend && this._statefulBackend._browserDisconnected) {
@@ -3664,6 +3708,13 @@ class UnifiedBackend {
 
   async _handleConsoleMessages(args = {}, options = {}) {
     const result = await this._transport.sendCommand('getConsoleMessages');
+
+    // "No tab attached" is a distinct state, not "no console output"
+    if (result.noTabAttached) {
+      return this._renderNoTabAttached('Console Messages', options,
+        { total: 0, filtered: 0, messages: [] });
+    }
+
     let allMessages = result.messages || [];
     const totalBeforeFilter = allMessages.length;
 
@@ -4229,6 +4280,8 @@ class UnifiedBackend {
     const action = args.action || 'list';
 
     // Action: clear
+    // With no tab attached the extension throws; the error reaches the
+    // user through the standard error channel instead of a false success
     if (action === 'clear') {
       await this._transport.sendCommand('clearTracking');
       if (options.rawResult) {
@@ -4237,7 +4290,7 @@ class UnifiedBackend {
       return {
         content: [{
           type: 'text',
-          text: `### Network Requests Cleared\n\nAll captured network requests have been cleared from memory.`
+          text: `### Network Requests Cleared\n\nCaptured network requests for the attached tab have been cleared from memory.`
         }],
         isError: false
       };
@@ -4245,6 +4298,18 @@ class UnifiedBackend {
 
     // Get requests list
     const result = await this._transport.sendCommand('getNetworkRequests');
+
+    // "No tab attached" is a distinct state, not "no traffic". For a plain
+    // list that's informative; details/replay were asked to act on a
+    // specific request and must fail rather than shape-shift into an
+    // empty list success.
+    if (result.noTabAttached) {
+      const isLookupAction = action === 'details' || action === 'replay';
+      return this._renderNoTabAttached('Network Requests', options,
+        isLookupAction ? { action } : { action, total: 0, requests: [] },
+        isLookupAction);
+    }
+
     const requests = result.requests || [];
 
     if (requests.length === 0) {
@@ -4376,7 +4441,7 @@ class UnifiedBackend {
         return {
           content: [{
             type: 'text',
-            text: `### Error\n\nRequest ID \`${requestId}\` not found.\n\nUse \`action='list'\` to see available request IDs.`
+            text: `### Error\n\nRequest ID \`${requestId}\` not found.\n\nRequest listings are scoped to the attached tab's current capture session, so IDs from earlier listings can expire after a tab switch, reconnect, or idle period. Use \`action='list'\` to get current request IDs.`
           }],
           isError: true
         };
@@ -4544,7 +4609,7 @@ class UnifiedBackend {
         return {
           content: [{
             type: 'text',
-            text: `### Error\n\nRequest ID \`${requestId}\` not found.\n\nUse \`action='list'\` to see available request IDs.`
+            text: `### Error\n\nRequest ID \`${requestId}\` not found.\n\nRequest listings are scoped to the attached tab's current capture session, so IDs from earlier listings can expire after a tab switch, reconnect, or idle period. Use \`action='list'\` to get current request IDs.`
           }],
           isError: true
         };

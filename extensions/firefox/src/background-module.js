@@ -12,6 +12,7 @@ import { IconManager } from '../shared/utils/icons.js';
 import { WebSocketConnection } from '../shared/connection/websocket.js';
 import { TabHandlers } from '../shared/handlers/tabs.js';
 import { NetworkTracker } from '../shared/handlers/network.js';
+import { registerCaptureCommandHandlers, registerTabCleanup } from '../shared/handlers/captureCommands.js';
 import { DialogHandler } from '../shared/handlers/dialogs.js';
 import { ConsoleHandler } from '../shared/handlers/console.js';
 import { createBrowserAdapter } from '../shared/adapters/browser.js';
@@ -183,6 +184,15 @@ browser.webNavigation.onCompleted.addListener(async (details) => {
   }
 });
 
+// Tab-close cleanup is shared across browsers
+registerTabCleanup(browser, {
+  tabHandlers,
+  networkTracker,
+  consoleHandler,
+  techStackInfo,
+  logger
+});
+
 // Initialize WebSocket connection
 const wsConnection = new WebSocketConnection(browser, logger, iconManager, buildTimestamp);
 
@@ -221,22 +231,13 @@ wsConnection.registerCommandHandler('openTestPage', async () => {
   };
 });
 
-wsConnection.registerCommandHandler('getNetworkRequests', async () => {
-  return { requests: networkTracker.getRequests() };
-});
-
-wsConnection.registerCommandHandler('clearTracking', async () => {
-  networkTracker.clearRequests();
-  return { success: true };
-});
-
-wsConnection.registerCommandHandler('getConsoleMessages', async () => {
-  return { messages: consoleHandler.getMessages() };
-});
-
-wsConnection.registerCommandHandler('clearConsoleMessages', async () => {
-  consoleHandler.clearMessages();
-  return { success: true };
+// Network/console read+clear handlers are shared across browsers (Firefox
+// has no CDP capture, so the webRequest tracker is the only source)
+registerCaptureCommandHandlers(wsConnection, {
+  tabHandlers,
+  networkTracker,
+  consoleHandler,
+  logger
 });
 
 wsConnection.registerCommandHandler('forwardCDPCommand', async (params) => {
@@ -275,7 +276,7 @@ async function handleCDPCommand(params) {
   logger.log('[Background] handleCDPCommand called:', method, 'tab:', attachedTabId);
 
   if (!attachedTabId) {
-    throw new Error('No tab attached. Call selectTab or createTab first.');
+    tabHandlers.requireAttachedTabId(); // Throws the standard guidance
   }
 
   switch (method) {

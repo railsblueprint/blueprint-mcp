@@ -12,9 +12,23 @@ export class NetworkTracker {
     this.browser = browserAPI;
     this.logger = logger;
 
-    // Network requests storage
-    this.requests = [];
-    this.maxRequests = 500; // Keep only last 500 requests
+    // Requests bucketed per tab so one busy tab cannot evict another tab's
+    // history. Requests that can't be attributed to a tab (tabId -1:
+    // service workers, extensions) are NOT stored: they would be visible
+    // to whichever tab is attached, leaking unrelated origins' auth
+    // headers across sessions. Per-client visibility for such traffic is
+    // tracked in mcp-d591. The webRequest listeners see every open tab, so
+    // a global cap bounds total memory regardless of tab count.
+    this.requestsByTab = new Map(); // tabId -> request array
+    this.maxRequests = 500; // Per-tab cap on stored requests
+    this.maxTotalRequests = 2000; // Cap across all tabs combined
+
+    // requestId -> request entry, for O(1) event updates. webRequest gives
+    // no tabId-stability guarantee across one request's events (prerender
+    // activation, tab destroyed mid-flight), so updates must not depend on
+    // the event's tabId matching the storage bucket.
+    this._byRequestId = new Map();
+    this._totalCount = 0;
 
     // Bind event handlers
     this._handleBeforeRequest = this._handleBeforeRequest.bind(this);
@@ -58,25 +72,75 @@ export class NetworkTracker {
   }
 
   /**
-   * Get all tracked requests
+   * Get requests scoped to a tab, in chronological order. With no tabId
+   * nothing is returned: leaking other tabs' traffic to an unattached
+   * caller is worse than an empty listing.
+   * @param {number} tabId - Tab to scope to (empty result if falsy)
    */
-  getRequests() {
-    return this.requests;
+  getRequestsForTab(tabId) {
+    if (!tabId) {
+      return [];
+    }
+    const tabRequests = this.requestsByTab.get(tabId) || [];
+    return tabRequests.slice().sort((a, b) => a.timestamp - b.timestamp);
   }
 
   /**
-   * Clear all tracked requests
+   * Clear tracked requests
+   * @param {number} tabId - Tab to clear (all tabs if omitted). Leaves -1
+   *   entries alone: they don't belong to any single tab (tab-close
+   *   cleanup uses this).
    */
-  clearRequests() {
-    this.requests = [];
-    this.logger.log('[NetworkTracker] Cleared all requests');
+  clearRequests(tabId = null) {
+    if (tabId === null) {
+      this.requestsByTab.clear();
+      this._byRequestId.clear();
+      this._totalCount = 0;
+      this.logger.log('[NetworkTracker] Cleared all requests');
+    } else {
+      this._dropBucket(tabId);
+      this.logger.log(`[NetworkTracker] Cleared requests for tab ${tabId}`);
+    }
   }
 
   /**
-   * Get requests count
+   * Remove one tab's bucket, keeping the index and total in sync
    */
-  getRequestsCount() {
-    return this.requests.length;
+  _dropBucket(tabId) {
+    const tabRequests = this.requestsByTab.get(tabId);
+    if (!tabRequests) {
+      return;
+    }
+    for (const request of tabRequests) {
+      // Redirects re-fire onBeforeRequest with the same requestId, so the
+      // index may point at a newer entry for this id — only unindex when
+      // this entry is the indexed one
+      if (this._byRequestId.get(request.requestId) === request) {
+        this._byRequestId.delete(request.requestId);
+      }
+    }
+    this._totalCount -= tabRequests.length;
+    this.requestsByTab.delete(tabId);
+  }
+
+  /**
+   * Evict the FIFO head of a bucket, keeping the index and total in sync
+   */
+  _evictOldest(tabId) {
+    const tabRequests = this.requestsByTab.get(tabId);
+    if (!tabRequests || tabRequests.length === 0) {
+      return;
+    }
+    const removed = tabRequests.shift();
+    // Same identity guard as _dropBucket: never unindex a surviving
+    // duplicate (redirects reuse requestIds)
+    if (this._byRequestId.get(removed.requestId) === removed) {
+      this._byRequestId.delete(removed.requestId);
+    }
+    this._totalCount--;
+    if (tabRequests.length === 0) {
+      this.requestsByTab.delete(tabId);
+    }
   }
 
   /**
@@ -84,10 +148,19 @@ export class NetworkTracker {
    * Captures initial request information
    */
   _handleBeforeRequest(details) {
-    const requestId = `${details.requestId}`;
+    // Unattributable requests are not stored (see constructor comment)
+    if (details.tabId < 0) {
+      return;
+    }
 
-    this.requests.push({
-      requestId: requestId,
+    let tabRequests = this.requestsByTab.get(details.tabId);
+    if (!tabRequests) {
+      tabRequests = [];
+      this.requestsByTab.set(details.tabId, tabRequests);
+    }
+
+    const request = {
+      requestId: `${details.requestId}`,
       url: details.url,
       method: details.method,
       type: details.type,
@@ -98,11 +171,31 @@ export class NetworkTracker {
       requestHeaders: null,
       responseHeaders: null,
       requestBody: details.requestBody
-    });
+    };
+    tabRequests.push(request);
+    this._byRequestId.set(request.requestId, request);
+    this._totalCount++;
 
-    // Keep only last maxRequests requests (FIFO)
-    if (this.requests.length > this.maxRequests) {
-      this.requests.shift();
+    // Keep only last maxRequests per tab (FIFO)
+    if (tabRequests.length > this.maxRequests) {
+      this._evictOldest(details.tabId);
+    }
+
+    // Bound total memory across all tabs by evicting the globally oldest
+    // FIFO heads
+    while (this._totalCount > this.maxTotalRequests) {
+      let oldestTabId = null;
+      let oldestTs = Infinity;
+      for (const [tabId, bucket] of this.requestsByTab) {
+        if (bucket.length > 0 && bucket[0].timestamp < oldestTs) {
+          oldestTs = bucket[0].timestamp;
+          oldestTabId = tabId;
+        }
+      }
+      if (oldestTabId === null) {
+        return;
+      }
+      this._evictOldest(oldestTabId);
     }
   }
 
@@ -111,7 +204,7 @@ export class NetworkTracker {
    * Captures response information
    */
   _handleCompleted(details) {
-    const request = this.requests.find(r => r.requestId === `${details.requestId}`);
+    const request = this._byRequestId.get(`${details.requestId}`);
     if (request) {
       request.statusCode = details.statusCode;
       request.statusText = details.statusLine;
@@ -124,7 +217,7 @@ export class NetworkTracker {
    * Captures request headers
    */
   _handleBeforeSendHeaders(details) {
-    const request = this.requests.find(r => r.requestId === `${details.requestId}`);
+    const request = this._byRequestId.get(`${details.requestId}`);
     if (request) {
       request.requestHeaders = details.requestHeaders;
     }
@@ -135,7 +228,7 @@ export class NetworkTracker {
    * Captures error information
    */
   _handleErrorOccurred(details) {
-    const request = this.requests.find(r => r.requestId === `${details.requestId}`);
+    const request = this._byRequestId.get(`${details.requestId}`);
     if (request) {
       request.statusCode = 0;
       request.statusText = details.error || 'Error';
