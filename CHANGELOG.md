@@ -1,3 +1,14 @@
+# v1.9.22 (2026-08-10)
+
+## Changes
+
+- Fix off-screen clicks, tab index consistency, and startup hardening (#52)
+- Apply review follow-ups: closeTab index, header normalization, guard consistency (#51)
+- Fix release blockers: header rendering, disable scoping, no-tab guards (#50)
+- Enable multi-tab debugger support with per-tab capture scoping (#39)
+- Fix Firefox extension stuck at "Connecting" to local MCP server (#48)
+
+
 # v1.9.21 (2025-12-21)
 
 ## Changes
