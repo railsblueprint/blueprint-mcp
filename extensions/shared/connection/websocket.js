@@ -48,8 +48,26 @@ export class WebSocketConnection {
   }
 
   _markSessionEstablished() {
+    if (this._sessionEstablished) {
+      return;
+    }
     this._sessionEstablished = true;
+    // Kept so a connection refused before any real traffic can roll the
+    // timestamp back (see _markSessionRejected)
+    this._connectedAtBeforeSession = this.lastConnectedAt;
+    this._sessionUsed = false;
     this.lastConnectedAt = Date.now();
+  }
+
+  _markSessionUsed() {
+    this._sessionUsed = true;
+  }
+
+  _markSessionRejected() {
+    if (this._sessionEstablished && !this._sessionUsed) {
+      this.lastConnectedAt = this._connectedAtBeforeSession;
+      this._sessionEstablished = false;
+    }
   }
 
   // Unbind all handlers and drop the socket. Handlers must be unbound
@@ -369,7 +387,14 @@ export class WebSocketConnection {
   _handleOpen() {
     this.logger.logAlways(`Connected to ${this.connectionUrl}`);
     this.isConnected = true;
-    this._markSessionEstablished();
+    // Free mode: the local server accepting the socket IS the session —
+    // it sends no unsolicited frame to wait for. A refusal (duplicate
+    // extension) arrives as an error frame and rolls this back.
+    // PRO mode: wait for authentication to actually succeed, so an
+    // expired-token reject loop can't keep refreshing lastConnectedAt.
+    if (!this.isPro) {
+      this._markSessionEstablished();
+    }
 
     // Update icon manager
     if (this.iconManager) {
@@ -422,8 +447,16 @@ export class WebSocketConnection {
       // Handle error responses from server
       if (message.error) {
         this.logger.logAlways('[WebSocket] Server error response:', message.error);
+        // A server error before any real traffic means this connection was
+        // refused (duplicate extension, failed auth). Undo the timestamp
+        // so a rejection loop can't masquerade as a healthy connection
+        // and starve consumers measuring downtime.
+        this._markSessionRejected();
         return;
       }
+
+      // Real inbound traffic confirms a working session
+      this._markSessionUsed();
 
       // Handle notifications (no id, has method)
       if (!message.id && message.method) {
@@ -604,6 +637,11 @@ export class WebSocketConnection {
       client_id: clientId,
       buildTimestamp: this.buildTimestamp
     };
+
+    // Authentication succeeded (every failure path above throws), so the
+    // PRO session is now genuinely established
+    this._markSessionEstablished();
+    this._markSessionUsed();
 
     this.logger.log('[WebSocket] Responding to authenticate request');
     return authResponse;

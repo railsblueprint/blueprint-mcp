@@ -242,7 +242,7 @@ class UnifiedBackend {
                     description: 'Type of interaction'
                   },
                   selector: { type: 'string', description: 'CSS selector (for click, type, clear, hover, scroll_to, scroll_by, scroll_into_view, select_option, file_upload, force_pseudo_state). For scroll_to/scroll_by: scrolls the element instead of the window' },
-                  text: { type: 'string', description: 'Text to type (for type action)' },
+                  text: { type: 'string', description: 'Text to type (for type action). Typed as real key events, so a newline behaves like pressing Enter: it inserts a line break in a textarea but submits a single-line form field.' },
                   key: { type: 'string', description: 'Key to press (for press_key action)' },
                   value: { type: 'string', description: 'Option value or text to select (for select_option action). Matches by value first, then by text if value not found. Case-insensitive for text matching.' },
                   pseudoStates: {
@@ -1288,6 +1288,7 @@ class UnifiedBackend {
                   }
 
                   matches.push({
+                    index: matches.length,
                     x: rect.left + rect.width / 2,
                     y: rect.top + rect.height / 2,
                     visible: visible,
@@ -1337,6 +1338,7 @@ class UnifiedBackend {
               }
 
               matches.push({
+                index: matches.length,
                 x: rect.left + rect.width / 2,
                 y: rect.top + rect.height / 2,
                 visible: visible,
@@ -1358,7 +1360,84 @@ class UnifiedBackend {
    * Handles both regular CSS selectors and :has-text() pseudo-selectors
    * Returns: { x, y, warning } or null
    */
-  async _findElement(selectorOrObj) {
+  /**
+   * Build the page-side expression that re-selects the matched elements,
+   * mirroring _findAllElements' two query forms.
+   */
+  _buildMatchQueryExpression(selectorOrObj) {
+    if (typeof selectorOrObj === 'object' && selectorOrObj.type === 'has-text') {
+      return `
+        (() => {
+          const baseSelector = ${JSON.stringify(selectorOrObj.baseSelector)};
+          const searchText = ${JSON.stringify(selectorOrObj.searchText)};
+          const remainderSelector = ${JSON.stringify(selectorOrObj.remainderSelector)};
+          const out = [];
+          for (const el of document.querySelectorAll(baseSelector)) {
+            const text = (el.textContent || el.innerText || '').trim();
+            if (!text.toLowerCase().includes(searchText.trim().toLowerCase())) continue;
+            let targetEl = el;
+            if (remainderSelector) {
+              const descendant = el.querySelector(remainderSelector);
+              if (!descendant) continue;
+              targetEl = descendant;
+            }
+            out.push(targetEl);
+          }
+          return out;
+        })()
+      `;
+    }
+    return `Array.from(document.querySelectorAll(${JSON.stringify(selectorOrObj)}))`;
+  }
+
+  /**
+   * Scroll the matched element into view and return fresh viewport
+   * coordinates. Mouse events are dispatched in viewport space, so an
+   * element below the fold must be scrolled into view first — otherwise
+   * the click is delivered at a point outside the window and silently
+   * hits nothing. Uses instant scrolling: smooth scrolling is animated
+   * and would leave the coordinates stale.
+   */
+  async _scrollIntoViewAndMeasure(selectorOrObj, index) {
+    const result = await this._transport.sendCommand('forwardCDPCommand', {
+      method: 'Runtime.evaluate',
+      params: {
+        expression: `
+          (() => {
+            const els = ${this._buildMatchQueryExpression(selectorOrObj)};
+            const el = els[${index}];
+            if (!el) return null;
+
+            const before = el.getBoundingClientRect();
+            const outOfView = before.top < 0 || before.left < 0 ||
+              before.bottom > window.innerHeight || before.right > window.innerWidth;
+            if (outOfView) {
+              el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            }
+
+            const rect = el.getBoundingClientRect();
+            return {
+              x: rect.left + rect.width / 2,
+              y: rect.top + rect.height / 2,
+              scrolled: outOfView,
+              inViewport: rect.top >= 0 && rect.left >= 0 &&
+                rect.bottom <= window.innerHeight && rect.right <= window.innerWidth
+            };
+          })()
+        `,
+        returnByValue: true
+      }
+    });
+
+    return result.result?.value || null;
+  }
+
+  /**
+   * @param {object} options - { ensureInViewport } scrolls the selected
+   *   element into view and re-measures before returning coordinates.
+   *   Callers that dispatch mouse events must pass it.
+   */
+  async _findElement(selectorOrObj, options = {}) {
     const matches = await this._findAllElements(selectorOrObj);
 
     if (matches.length === 0) {
@@ -1388,6 +1467,18 @@ class UnifiedBackend {
 
     // Use first visible element, or first element if all hidden
     const selectedMatch = visibleMatches.length > 0 ? visibleMatches[0] : matches[0];
+
+    if (options.ensureInViewport && selectedMatch.index !== undefined) {
+      const measured = await this._scrollIntoViewAndMeasure(selectorOrObj, selectedMatch.index);
+      if (measured) {
+        if (!measured.inViewport) {
+          warning = warning
+            ? `${warning}. Element could not be brought fully into view`
+            : 'Element could not be brought fully into view';
+        }
+        return { x: measured.x, y: measured.y, warning };
+      }
+    }
 
     return {
       x: selectedMatch.x,
@@ -1697,8 +1788,9 @@ class UnifiedBackend {
             }
 
             // Not a select - proceed with normal click
-            // Get element location
-            const elemResult = await this._findElement(processedSelector);
+            // Get element location, scrolling it into view first so the
+            // mouse event lands inside the viewport
+            const elemResult = await this._findElement(processedSelector, { ensureInViewport: true });
 
             if (!elemResult) {
               // Try to find alternative selectors
@@ -1905,16 +1997,9 @@ class UnifiedBackend {
               }
             });
 
-            // Type each character
-            for (const char of action.text) {
-              await this._transport.sendCommand('forwardCDPCommand', {
-                method: 'Input.dispatchKeyEvent',
-                params: {
-                  type: 'char',
-                  text: char
-                }
-              });
-            }
+            // Type as full keyDown/keyUp sequences (see _typeText):
+            // required by canvas-based editors like Google Sheets
+            await this._typeText(action.text);
 
             // Get the final value of the field after typing
             const valueResult = await this._transport.sendCommand('forwardCDPCommand', {
@@ -1963,53 +2048,8 @@ class UnifiedBackend {
           }
 
           case 'press_key': {
-            const key = action.key;
-
-            // Map common keys to their key codes
-            const keyCodeMap = {
-              'Enter': 13,
-              'Escape': 27,
-              'Tab': 9,
-              'Backspace': 8,
-              'Delete': 46,
-              'ArrowUp': 38,
-              'ArrowDown': 40,
-              'ArrowLeft': 37,
-              'ArrowRight': 39,
-              'Space': 32
-            };
-
-            const code = keyCodeMap[key];
-            const text = key === 'Enter' ? '\r' : (key === 'Tab' ? '\t' : (key.length === 1 ? key : ''));
-
-            const baseParams = {
-              key: key,
-              code: key,
-              windowsVirtualKeyCode: code,
-              nativeVirtualKeyCode: code,
-              text: text,
-              unmodifiedText: text
-            };
-
-            // Send keyDown
-            await this._transport.sendCommand('forwardCDPCommand', {
-              method: 'Input.dispatchKeyEvent',
-              params: {
-                type: 'keyDown',
-                ...baseParams
-              }
-            });
-
-            // Send keyUp
-            await this._transport.sendCommand('forwardCDPCommand', {
-              method: 'Input.dispatchKeyEvent',
-              params: {
-                type: 'keyUp',
-                ...baseParams
-              }
-            });
-
-            result = `Pressed key: ${key}`;
+            await this._pressKey(action.key);
+            result = `Pressed key: ${action.key}`;
             break;
           }
 
@@ -2017,8 +2057,9 @@ class UnifiedBackend {
             // Process selector (preprocess + validate)
             const processedSelector = this._processSelector(action.selector);
 
-            // Get element location
-            const elemResult = await this._findElement(processedSelector);
+            // Get element location, scrolling it into view first so the
+            // mouse event lands inside the viewport
+            const elemResult = await this._findElement(processedSelector, { ensureInViewport: true });
 
             if (!elemResult) {
               // Try to find alternative selectors
@@ -2499,8 +2540,16 @@ class UnifiedBackend {
                   (() => {
                     const el = ${selectorExpr};
                     if (!el) return { error: 'Element not found' };
-                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    return { success: true };
+                    // Instant, not smooth: smooth scrolling is animated, so
+                    // the command would return before the page has moved and
+                    // any coordinates measured afterwards would be stale
+                    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                    const rect = el.getBoundingClientRect();
+                    return {
+                      success: true,
+                      scrollY: Math.round(window.scrollY),
+                      inViewport: rect.top >= 0 && rect.bottom <= window.innerHeight
+                    };
                   })()
                 `,
                 returnByValue: true
@@ -2511,7 +2560,11 @@ class UnifiedBackend {
               throw new Error(`${scrollResult.result.value.error}: ${action.selector}`);
             }
 
-            result = `Scrolled ${action.selector} into view`;
+            const scrollValue = scrollResult.result?.value || {};
+            result = `Scrolled ${action.selector} into view (scrollY: ${scrollValue.scrollY ?? 'unknown'})`;
+            if (scrollValue.inViewport === false) {
+              result += ' ⚠️ element still outside the viewport';
+            }
             break;
           }
 
@@ -2919,6 +2972,14 @@ class UnifiedBackend {
           (() => {
             const el = document.querySelector(${JSON.stringify(args.selector)});
             if (!el) return null;
+            // Scroll into view first: mouse events are dispatched in
+            // viewport space, so a below-the-fold element would otherwise
+            // be clicked at a point outside the window
+            const before = el.getBoundingClientRect();
+            if (before.top < 0 || before.bottom > window.innerHeight ||
+                before.left < 0 || before.right > window.innerWidth) {
+              el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            }
             const rect = el.getBoundingClientRect();
             return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
           })()
@@ -2964,6 +3025,147 @@ class UnifiedBackend {
     };
   }
 
+  /**
+   * Key event metadata for one typed character: the physical `code`, the
+   * virtual key code, and whether the character requires Shift. Editors
+   * that gate on keydown (canvas apps like Google Sheets) read these, so
+   * the mapping covers the full US-keyboard printable set. Characters
+   * outside it (accented letters, CJK, emoji) still carry `text`, which
+   * standard inputs use for insertion.
+   */
+  _keyEventParamsForChar(char) {
+    // US layout: unshifted char -> [code, shifted char]
+    const KEY_LAYOUT = {
+      '`': ['Backquote', '~'], '-': ['Minus', '_'], '=': ['Equal', '+'],
+      '[': ['BracketLeft', '{'], ']': ['BracketRight', '}'], '\\': ['Backslash', '|'],
+      ';': ['Semicolon', ':'], "'": ['Quote', '"'], ',': ['Comma', '<'],
+      '.': ['Period', '>'], '/': ['Slash', '?'], ' ': ['Space', ' ']
+    };
+    const DIGIT_SHIFTED = ')!@#$%^&*(';
+
+    let code = '';
+    let virtualKeyCode = 0;
+    let shift = false;
+
+    if (/[a-zA-Z]/.test(char)) {
+      const upper = char.toUpperCase();
+      code = `Key${upper}`;
+      virtualKeyCode = upper.charCodeAt(0);
+      shift = char !== char.toLowerCase();
+    } else if (/[0-9]/.test(char)) {
+      code = `Digit${char}`;
+      virtualKeyCode = char.charCodeAt(0);
+    } else if (DIGIT_SHIFTED.includes(char)) {
+      const digit = String(DIGIT_SHIFTED.indexOf(char));
+      code = `Digit${digit}`;
+      virtualKeyCode = digit.charCodeAt(0);
+      shift = true;
+    } else if (KEY_LAYOUT[char]) {
+      code = KEY_LAYOUT[char][0];
+      virtualKeyCode = char === ' ' ? 32 : char.charCodeAt(0);
+    } else {
+      const unshifted = Object.keys(KEY_LAYOUT).find(k => KEY_LAYOUT[k][1] === char);
+      if (unshifted) {
+        code = KEY_LAYOUT[unshifted][0];
+        virtualKeyCode = unshifted.charCodeAt(0);
+        shift = true;
+      }
+    }
+
+    return {
+      key: char,
+      code,
+      windowsVirtualKeyCode: virtualKeyCode,
+      nativeVirtualKeyCode: virtualKeyCode,
+      modifiers: shift ? 8 : 0, // CDP modifier bit 8 = Shift
+      text: char,
+      unmodifiedText: char
+    };
+  }
+
+  /**
+   * Key event metadata for a named key (Enter, Tab, arrows...). Single
+   * characters fall through to _keyEventParamsForChar so typing and
+   * press_key emit identical events for the same keystroke.
+   */
+  _keyEventParamsForKey(key) {
+    const NAMED_KEYS = {
+      Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46,
+      ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+      Space: 32, Home: 36, End: 35, PageUp: 33, PageDown: 34
+    };
+
+    if (key.length === 1) {
+      return this._keyEventParamsForChar(key);
+    }
+
+    const virtualKeyCode = NAMED_KEYS[key] || 0;
+    const text = key === 'Enter' ? '\r' : (key === 'Tab' ? '\t' : '');
+    return {
+      key,
+      code: key === 'Space' ? 'Space' : key,
+      windowsVirtualKeyCode: virtualKeyCode,
+      nativeVirtualKeyCode: virtualKeyCode,
+      modifiers: 0,
+      text,
+      unmodifiedText: text
+    };
+  }
+
+  /**
+   * Press one key as a keyDown/keyUp pair
+   */
+  async _pressKey(key) {
+    const params = this._keyEventParamsForKey(key);
+    for (const type of ['keyDown', 'keyUp']) {
+      await this._transport.sendCommand('forwardCDPCommand', {
+        method: 'Input.dispatchKeyEvent',
+        params: { type, ...params }
+      });
+    }
+  }
+
+  /**
+   * Type text as full keyDown/keyUp sequences. The keyDown carries the
+   * text (which performs the insertion — no separate 'char' event, that
+   * would double-insert in standard inputs), and canvas-based editors
+   * like Google Sheets require the full sequence with key codes to
+   * commit the input (issue #36).
+   *
+   * Newlines are the exception: they are sent as an inert 'char' event.
+   * A trusted Enter keyDown submits forms, so typing multi-line text
+   * would navigate away mid-string — callers wanting a real Enter use
+   * the press_key action explicitly.
+   */
+  async _typeText(text) {
+    for (const char of text) {
+      if (char === '\n' || char === '\r') {
+        await this._transport.sendCommand('forwardCDPCommand', {
+          method: 'Input.dispatchKeyEvent',
+          params: { type: 'char', text: '\n' }
+        });
+        continue;
+      }
+
+      const params = this._keyEventParamsForChar(char);
+      await this._transport.sendCommand('forwardCDPCommand', {
+        method: 'Input.dispatchKeyEvent',
+        params: { type: 'keyDown', ...params }
+      });
+      await this._transport.sendCommand('forwardCDPCommand', {
+        method: 'Input.dispatchKeyEvent',
+        params: {
+          type: 'keyUp',
+          key: params.key,
+          code: params.code,
+          windowsVirtualKeyCode: params.windowsVirtualKeyCode,
+          nativeVirtualKeyCode: params.nativeVirtualKeyCode,
+          modifiers: params.modifiers
+        }
+      });
+    }
+  }
+
   async _handleType(args) {
     // Focus element first
     await this._transport.sendCommand('forwardCDPCommand', {
@@ -2974,16 +3176,7 @@ class UnifiedBackend {
       }
     });
 
-    // Type each character
-    for (const char of args.text) {
-      await this._transport.sendCommand('forwardCDPCommand', {
-        method: 'Input.dispatchKeyEvent',
-        params: {
-          type: 'char',
-          text: char
-        }
-      });
-    }
+    await this._typeText(args.text);
 
     return {
       content: [{
@@ -2996,50 +3189,7 @@ class UnifiedBackend {
 
   async _handlePressKey(args) {
     const key = args.key;
-
-    // Map common keys to their key codes
-    const keyCodeMap = {
-      'Enter': 13,
-      'Escape': 27,
-      'Tab': 9,
-      'Backspace': 8,
-      'Delete': 46,
-      'ArrowUp': 38,
-      'ArrowDown': 40,
-      'ArrowLeft': 37,
-      'ArrowRight': 39,
-      'Space': 32
-    };
-
-    const code = keyCodeMap[key];
-    const text = key === 'Enter' ? '\r' : (key === 'Tab' ? '\t' : (key.length === 1 ? key : ''));
-
-    const baseParams = {
-      key: key,
-      code: key,
-      windowsVirtualKeyCode: code,
-      nativeVirtualKeyCode: code,
-      text: text,
-      unmodifiedText: text
-    };
-
-    // Send keyDown
-    await this._transport.sendCommand('forwardCDPCommand', {
-      method: 'Input.dispatchKeyEvent',
-      params: {
-        type: 'keyDown',
-        ...baseParams
-      }
-    });
-
-    // Send keyUp
-    await this._transport.sendCommand('forwardCDPCommand', {
-      method: 'Input.dispatchKeyEvent',
-      params: {
-        type: 'keyUp',
-        ...baseParams
-      }
-    });
+    await this._pressKey(key);
 
     return {
       content: [{
@@ -3059,6 +3209,14 @@ class UnifiedBackend {
           (() => {
             const el = document.querySelector(${JSON.stringify(args.selector)});
             if (!el) return null;
+            // Scroll into view first: mouse events are dispatched in
+            // viewport space, so a below-the-fold element would otherwise
+            // be clicked at a point outside the window
+            const before = el.getBoundingClientRect();
+            if (before.top < 0 || before.bottom > window.innerHeight ||
+                before.left < 0 || before.right > window.innerWidth) {
+              el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            }
             const rect = el.getBoundingClientRect();
             return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
           })()
@@ -4897,22 +5055,26 @@ This request was captured by the browser extension's background tracker (webRequ
   async _handleListExtensions(options = {}) {
     const result = await this._transport.sendCommand('listExtensions', {});
 
+    // The extension returns only { extensions }; count is derived here so
+    // the header doesn't render "Total: undefined"
+    const extensions = result.extensions || [];
+
     if (options.rawResult) {
       return {
         success: true,
-        count: result.count || 0,
-        extensions: result.extensions || []
+        count: extensions.length,
+        extensions
       };
     }
 
-    const extList = (result.extensions || [])
+    const extList = extensions
       .map(ext => `- ${ext.name} (v${ext.version}) ${ext.enabled ? '[enabled]' : '[disabled]'}`)
       .join('\n');
 
     return {
       content: [{
         type: 'text',
-        text: `### Browser Extensions\n\nTotal: ${result.count}\n\n${extList}`
+        text: `### Browser Extensions\n\nTotal: ${extensions.length}\n\n${extList}`
       }],
       isError: false
     };
