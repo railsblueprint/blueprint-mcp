@@ -30,6 +30,58 @@ export class WebSocketConnection {
 
     // Notification handlers - for handling server notifications
     this.notificationHandlers = new Map();
+
+    // Session lifecycle state. _sessionEstablished tracks an established
+    // connection separately from isConnected, which error handlers may
+    // clear before the close event arrives; lastConnectedAt lets consumers
+    // (e.g. the extension's debugger grace sweep) measure how long the
+    // connection has genuinely been down.
+    this._sessionEstablished = false;
+    // Last moment a session was known to be up: set when a session is
+    // established AND when it is lost, so (now - lastConnectedAt) measures
+    // how long the connection has actually been down
+    this.lastConnectedAt = 0;
+
+    // Bumped by connect() and disconnect(); a connect() attempt whose
+    // generation is stale by socket-creation time aborts itself
+    this._connectGeneration = 0;
+  }
+
+  _markSessionEstablished() {
+    this._sessionEstablished = true;
+    this.lastConnectedAt = Date.now();
+  }
+
+  // Unbind all handlers and drop the socket. Handlers must be unbound
+  // before close() so a stale socket's events can never fire against the
+  // live connection state. close() is a no-op on an already-closed socket.
+  _releaseSocket() {
+    if (!this.socket) {
+      return;
+    }
+    this.socket.onopen = null;
+    this.socket.onmessage = null;
+    this.socket.onerror = null;
+    this.socket.onclose = null;
+    this.socket.close();
+    this.socket = null;
+  }
+
+  _markSessionLost() {
+    if (this._sessionEstablished) {
+      this._sessionEstablished = false;
+      this.lastConnectedAt = Date.now();
+    }
+  }
+
+  /**
+   * True when no established session exists. Unlike isConnected (which
+   * error handlers may clear before lastConnectedAt is stamped), this
+   * flips only together with lastConnectedAt, so consumers measuring
+   * downtime never see a half-updated pair.
+   */
+  isSessionDown() {
+    return !this._sessionEstablished;
   }
 
   /**
@@ -177,6 +229,18 @@ export class WebSocketConnection {
    * Connect to MCP server
    */
   async connect() {
+    // Only one socket may exist at a time: an orphaned socket's close
+    // event would run _handleClose against the live connection. Each call
+    // supersedes any earlier connect() still in its async window (the
+    // generation check below), and disconnect() bumps the generation so a
+    // stale attempt never opens a socket with pre-disconnect settings
+    // (e.g. a Free-mode URL resolved before a PRO login).
+    if (this.socket) {
+      this.logger.log('[WebSocket] Already connected, skipping');
+      return;
+    }
+    const generation = ++this._connectGeneration;
+
     try {
       // Check if extension is enabled
       const isEnabled = await this.isExtensionEnabled();
@@ -192,6 +256,13 @@ export class WebSocketConnection {
 
       // Get connection URL (handles PRO vs Free mode)
       const url = await this.getConnectionUrl();
+
+      // Superseded by a newer connect() or a disconnect() while resolving
+      // the URL — abort without touching the current state
+      if (generation !== this._connectGeneration || this.socket) {
+        this.logger.log('[WebSocket] Connect attempt superseded, aborting');
+        return;
+      }
       this.connectionUrl = url; // Store for logging
 
       // Create WebSocket connection
@@ -220,19 +291,26 @@ export class WebSocketConnection {
    * Disconnect from MCP server
    */
   disconnect() {
+    // Invalidate any connect() attempt still in its async window
+    this._connectGeneration++;
+
     // Clear reconnect timeout
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
     }
 
-    // Close socket
-    if (this.socket) {
-      this.socket.close();
-      this.socket = null;
-    }
+    // Close socket. Unbinding first means the async close event can't run
+    // _handleClose, which would notify listeners a second time and
+    // schedule a reconnect after an explicit disconnect
+    this._releaseSocket();
 
     this.isConnected = false;
+
+    // The unbound close event can no longer reach _handleClose, so the
+    // token refresh timer is stopped here
+    this.stopTokenRefreshTimer();
+    this._markSessionLost();
 
     // Update icon manager to show disconnected state
     if (this.iconManager) {
@@ -291,6 +369,7 @@ export class WebSocketConnection {
   _handleOpen() {
     this.logger.logAlways(`Connected to ${this.connectionUrl}`);
     this.isConnected = true;
+    this._markSessionEstablished();
 
     // Update icon manager
     if (this.iconManager) {
@@ -549,6 +628,12 @@ export class WebSocketConnection {
   _handleClose(event) {
     this.logger.logAlways(`Disconnected - Code: ${event?.code}, Reason: ${event?.reason || 'No reason provided'}, Clean: ${event?.wasClean}`);
     this.isConnected = false;
+
+    // Release the socket so the next connect() isn't blocked by the
+    // single-socket guard; unbind handlers so nothing fires twice
+    this._releaseSocket();
+
+    this._markSessionLost();
 
     // Stop periodic token refresh check
     this.stopTokenRefreshTimer();

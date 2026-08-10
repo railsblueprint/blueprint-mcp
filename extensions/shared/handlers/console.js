@@ -13,9 +13,13 @@ export class ConsoleHandler {
     this.browser = browserAdapter.getRawAPI();
     this.logger = logger;
 
-    // Console messages storage (per tab)
-    this.messages = [];
-    this.maxMessages = 1000; // Keep only last 1000 messages
+    // Console messages storage, bucketed per tab so one tab's messages
+    // cannot evict another tab's. A global cap bounds total memory across
+    // however many tabs are being captured.
+    this.messagesByTab = new Map(); // tabId -> message array
+    this.maxMessages = 1000; // Per-tab cap on stored messages
+    this.maxTotalMessages = 5000; // Cap across all tabs combined
+    this._totalCount = 0; // Maintained so the caps cost O(1) per message
 
     // Message listener tracking (prevent duplicates)
     this._messageListenerSetUp = false;
@@ -23,42 +27,82 @@ export class ConsoleHandler {
   }
 
   /**
-   * Get all captured console messages
-   * @param {number} tabId - Optional tab ID to filter by
+   * Get captured console messages for one tab, in chronological order.
+   * Messages are only served per tab — never other tabs' output. Named
+   * ForTab (replacing the old getMessages()) so stale all-tabs callers
+   * fail loudly instead of silently changing meaning.
+   * @param {number} tabId - Tab to read (empty result if absent)
    */
-  getMessages(tabId = null) {
-    if (tabId === null) {
-      return this.messages.slice(); // Return copy of all messages
+  getMessagesForTab(tabId) {
+    const messages = tabId ? this.messagesByTab.get(tabId) : null;
+    if (!messages) {
+      return [];
     }
-    // Filter by tab ID
-    return this.messages.filter(msg => msg.tabId === tabId);
+    // CDP delivers buffered events late with their original timestamps, so
+    // arrival order isn't chronological order
+    return messages.slice().sort((a, b) => a.timestamp - b.timestamp);
   }
 
   /**
    * Add a console message
    */
   addMessage(message) {
-    this.messages.push(message);
+    let messages = this.messagesByTab.get(message.tabId);
+    if (!messages) {
+      messages = [];
+      this.messagesByTab.set(message.tabId, messages);
+    }
+    messages.push(message);
+    this._totalCount++;
 
-    // Keep only last maxMessages
-    if (this.messages.length > this.maxMessages) {
-      this.messages.shift();
+    // Keep only last maxMessages per tab
+    if (messages.length > this.maxMessages) {
+      messages.shift();
+      this._totalCount--;
+    }
+
+    // Bound total memory across all tabs: each add can exceed the global
+    // cap by at most one, so a single eviction suffices. The victim is the
+    // bucket whose HEAD is oldest — approximate, since buckets are
+    // arrival-ordered and replays can park older timestamps mid-bucket,
+    // but memory stays exactly bounded either way
+    if (this._totalCount > this.maxTotalMessages) {
+      let oldestTabId = null;
+      let oldestTs = Infinity;
+      for (const [tabId, bucket] of this.messagesByTab) {
+        if (bucket.length > 0 && bucket[0].timestamp < oldestTs) {
+          oldestTs = bucket[0].timestamp;
+          oldestTabId = tabId;
+        }
+      }
+      if (oldestTabId !== null) {
+        const bucket = this.messagesByTab.get(oldestTabId);
+        bucket.shift();
+        this._totalCount--;
+        if (bucket.length === 0) {
+          this.messagesByTab.delete(oldestTabId);
+        }
+      }
     }
   }
 
   /**
-   * Clear all captured messages
+   * Clear captured messages
+   * @param {number} tabId - Optional tab ID to clear (all tabs if omitted)
    */
-  clearMessages() {
-    this.messages = [];
-    this.logger.log('[ConsoleHandler] Messages cleared');
-  }
-
-  /**
-   * Get messages count
-   */
-  getMessagesCount() {
-    return this.messages.length;
+  clearMessages(tabId = null) {
+    if (tabId === null) {
+      this.messagesByTab.clear();
+      this._totalCount = 0;
+      this.logger.log('[ConsoleHandler] Messages cleared');
+    } else {
+      const messages = this.messagesByTab.get(tabId);
+      if (messages) {
+        this._totalCount -= messages.length;
+        this.messagesByTab.delete(tabId);
+      }
+      this.logger.log(`[ConsoleHandler] Messages cleared for tab ${tabId}`);
+    }
   }
 
   /**
