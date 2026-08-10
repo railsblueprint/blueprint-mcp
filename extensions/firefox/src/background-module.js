@@ -209,8 +209,8 @@ wsConnection.registerCommandHandler('selectTab', async (params) => {
   return await tabHandlers.selectTab(params);
 });
 
-wsConnection.registerCommandHandler('closeTab', async () => {
-  return await tabHandlers.closeTab();
+wsConnection.registerCommandHandler('closeTab', async (params) => {
+  return await tabHandlers.closeTab(params?.index);
 });
 
 wsConnection.registerCommandHandler('openTestPage', async () => {
@@ -271,11 +271,13 @@ wsConnection.connect();
  */
 async function handleCDPCommand(params) {
   const { method, params: cdpParams } = params;
+  // Log before the guard so a no-tab failure still records which method
+  // was attempted
+  logger.log('[Background] handleCDPCommand called:', method);
+
   // Single read: guard and snapshot in one call, so a tab attaching
   // between a check and a later read can't let dispatch run with null
   const attachedTabId = tabHandlers.requireAttachedTabId();
-
-  logger.log('[Background] handleCDPCommand called:', method, 'tab:', attachedTabId);
 
   switch (method) {
     case 'Page.navigate': {
@@ -380,10 +382,10 @@ async function handleCDPCommand(params) {
     }
 
     case 'Input.dispatchMouseEvent':
-      return await handleMouseEvent(cdpParams);
+      return await handleMouseEvent(cdpParams, attachedTabId);
 
     case 'Input.dispatchKeyEvent':
-      return await handleKeyEvent(cdpParams);
+      return await handleKeyEvent(cdpParams, attachedTabId);
 
     case 'Page.captureScreenshot': {
       try {
@@ -451,9 +453,9 @@ async function handleCDPCommand(params) {
 /**
  * Handle mouse events via JavaScript injection
  */
-async function handleMouseEvent(params) {
+// attachedTabId is the caller's guarded snapshot (no re-read race)
+async function handleMouseEvent(params, attachedTabId) {
   const { type, x, y, button = 'left', clickCount = 1 } = params;
-  const attachedTabId = tabHandlers.requireAttachedTabId();
 
   const buttonMap = { left: 0, middle: 1, right: 2 };
   const buttonNum = buttonMap[button] || 0;
@@ -536,9 +538,9 @@ async function handleMouseEvent(params) {
 /**
  * Handle keyboard events via JavaScript injection
  */
-async function handleKeyEvent(params) {
+// attachedTabId is the caller's guarded snapshot (no re-read race)
+async function handleKeyEvent(params, attachedTabId) {
   const { type, key, code, text } = params;
-  const attachedTabId = tabHandlers.requireAttachedTabId();
 
   // Map CDP event types to DOM event types
   const eventTypeMap = {

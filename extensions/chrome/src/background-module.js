@@ -665,14 +665,16 @@ async function fetchRequestData(attachedTabId, method, params, requestId) {
 
 // Handle CDP commands from MCP server
 async function handleCDPCommand(cdpMethod, cdpParams) {
+  // Log before the guard so a no-tab failure still records which method
+  // was attempted
+  logger.log(`[Background] handleCDPCommand called: ${cdpMethod}`);
+
   // Single read: guard and snapshot in one call, so a tab attaching
   // between a check and a later read can't let dispatch run with null.
   // Target.getTargets is the only command that works without a tab.
   const attachedTabId = cdpMethod === 'Target.getTargets'
     ? tabHandlers.getAttachedTabId()
     : tabHandlers.requireAttachedTabId();
-
-  logger.log(`[Background] handleCDPCommand called: ${cdpMethod} tab: ${attachedTabId}`);
 
   try {
     return await dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId);
@@ -819,7 +821,7 @@ async function dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId) {
     }
 
     case 'Input.dispatchMouseEvent':
-      return await handleMouseEvent(cdpParams);
+      return await handleMouseEvent(cdpParams, attachedTabId);
 
     case 'Input.dispatchKeyEvent': {
       // Use Chrome debugger for real trusted key events (enables form submission, etc.)
@@ -1667,8 +1669,9 @@ async function dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId) {
 // Track last mousedown for click synthesis
 let lastMouseDown = null;
 
-async function handleMouseEvent(params) {
-  const attachedTabId = tabHandlers.getAttachedTabId();
+// attachedTabId is the caller's guarded snapshot, so the whole event
+// targets the same tab as the rest of the command (no re-read race)
+async function handleMouseEvent(params, attachedTabId) {
   const { type, x, y, button = 'left' } = params;
   // clickCount parameter not currently used
 
@@ -1984,8 +1987,8 @@ registerCaptureCommandHandlers(wsConnection, {
 });
 
 wsConnection.registerCommandHandler('getResponseBody', async ({ requestId }) => {
-  tabHandlers.requireAttachedTabId();
-
+  // No leading guard: handleCDPCommand guards internally, and its throw is
+  // caught below so the no-tab condition always takes the { error } shape
   try {
     // The CDP case checks availability first and attaches only when the
     // request is servable, so no eager Network.enable here
@@ -1997,8 +2000,6 @@ wsConnection.registerCommandHandler('getResponseBody', async ({ requestId }) => 
 });
 
 wsConnection.registerCommandHandler('getRequestPostData', async ({ requestId }) => {
-  tabHandlers.requireAttachedTabId();
-
   try {
     const result = await handleCDPCommand('Network.getRequestPostData', { requestId });
     return result;
