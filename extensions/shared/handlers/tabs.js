@@ -330,10 +330,7 @@ export class TabHandlers {
       wasAttached = (tabIdToClose === this.attachedTabId);
     } else {
       // Close currently attached tab
-      if (!this.attachedTabId) {
-        throw new Error('No tab attached');
-      }
-      tabIdToClose = this.attachedTabId;
+      tabIdToClose = this.requireAttachedTabId();
       wasAttached = true;
     }
 

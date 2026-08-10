@@ -271,13 +271,11 @@ wsConnection.connect();
  */
 async function handleCDPCommand(params) {
   const { method, params: cdpParams } = params;
-  const attachedTabId = tabHandlers.getAttachedTabId();
+  // Single read: guard and snapshot in one call, so a tab attaching
+  // between a check and a later read can't let dispatch run with null
+  const attachedTabId = tabHandlers.requireAttachedTabId();
 
   logger.log('[Background] handleCDPCommand called:', method, 'tab:', attachedTabId);
-
-  if (!attachedTabId) {
-    tabHandlers.requireAttachedTabId(); // Throws the standard guidance
-  }
 
   switch (method) {
     case 'Page.navigate': {
@@ -455,11 +453,7 @@ async function handleCDPCommand(params) {
  */
 async function handleMouseEvent(params) {
   const { type, x, y, button = 'left', clickCount = 1 } = params;
-  const attachedTabId = tabHandlers.getAttachedTabId();
-
-  if (!attachedTabId) {
-    throw new Error('No tab attached');
-  }
+  const attachedTabId = tabHandlers.requireAttachedTabId();
 
   const buttonMap = { left: 0, middle: 1, right: 2 };
   const buttonNum = buttonMap[button] || 0;
@@ -544,11 +538,7 @@ async function handleMouseEvent(params) {
  */
 async function handleKeyEvent(params) {
   const { type, key, code, text } = params;
-  const attachedTabId = tabHandlers.getAttachedTabId();
-
-  if (!attachedTabId) {
-    throw new Error('No tab attached');
-  }
+  const attachedTabId = tabHandlers.requireAttachedTabId();
 
   // Map CDP event types to DOM event types
   const eventTypeMap = {

@@ -893,16 +893,14 @@ class StatefulBackend {
       this._activeBackend = null;
     }
 
-    // Close proxy connection if we're in proxy mode. The extension stays
-    // connected to the relay after we leave, so tell it this is a
-    // deliberate disable — otherwise its debugger sessions (and the
-    // "being debugged" banners) would persist indefinitely.
+    // Close proxy connection if we're in proxy mode. Deliberately NO
+    // serverShuttingDown here: the relay multiplexes multiple MCP clients
+    // onto one extension, so the notification would force-detach every
+    // client's debugger sessions, not just this one's. Until the relay
+    // protocol carries client identity (mcp-57fb / mcp-d591), a PRO
+    // disable leaves the other clients' sessions untouched and this
+    // client's sessions to the extension's idle handling.
     if (this._proxyConnection) {
-      try {
-        this._proxyConnection.sendNotification('serverShuttingDown', {});
-      } catch (error) {
-        debugLog('[StatefulBackend] Could not notify extension of shutdown:', error.message);
-      }
       await this._proxyConnection.close();
       this._proxyConnection = null;
     }
