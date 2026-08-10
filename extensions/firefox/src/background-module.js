@@ -18,28 +18,39 @@ import { ConsoleHandler } from '../shared/handlers/console.js';
 import { createBrowserAdapter } from '../shared/adapters/browser.js';
 import { wrapWithUnwrap, shouldUnwrap } from '../shared/utils/unwrap.js';
 import { setupInstallHandler } from '../shared/handlers/install.js';
+import { safeInit, reportFatalInit } from '../shared/utils/safeInit.js';
 
 // Initialize browser adapter at top level (before async IIFE) for install handler
 const browserAdapter = createBrowserAdapter();
 const browser = browserAdapter.getRawAPI();
 
-// Set up welcome page to open on first install (must be at top level)
-// Browser name is auto-detected from manifest.json
-setupInstallHandler(browser);
+const PRODUCT_NAME = 'Blueprint MCP for Firefox';
 
-// Set up keepalive alarm at TOP LEVEL (prevents service worker suspension in MV3)
-// This must be synchronous to ensure the listener is registered before service worker sleeps
-if (browser.alarms) {
-  browser.alarms.create('keepalive', { periodInMinutes: 1 });
-  browser.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === 'keepalive') {
-      console.log('[Background] Keepalive alarm - service worker active');
-    }
-  });
-}
+// Top-level init steps are individually guarded: a throw here would kill
+// the whole module before the connection code ever runs (see issue #49,
+// where the background died on startup with no add-on-prefixed error)
+safeInit(PRODUCT_NAME, 'install handler', () => {
+  // Set up welcome page to open on first install (must be at top level)
+  // Browser name is auto-detected from manifest.json
+  setupInstallHandler(browser);
+});
 
-// Main initialization
-(async () => {
+safeInit(PRODUCT_NAME, 'keepalive alarm', () => {
+  // Set up keepalive alarm at TOP LEVEL (prevents service worker suspension in MV3)
+  // This must be synchronous to ensure the listener is registered before service worker sleeps
+  if (browser.alarms) {
+    browser.alarms.create('keepalive', { periodInMinutes: 1 });
+    browser.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === 'keepalive') {
+        console.log('[Background] Keepalive alarm - service worker active');
+      }
+    });
+  }
+});
+
+// Main initialization. The catch is the line to look for when the
+// extension never connects (issue #49)
+reportFatalInit((async () => {
 
 /**
  * Execute script helper - Manifest V3 compatible
@@ -70,10 +81,14 @@ async function executeScript(tabId, options) {
   throw new Error('No executeScript API available - scripting permission may be missing');
 }
 
-// Initialize logger
-const logger = new Logger('Blueprint MCP for Firefox');
-await logger.init(browser);
+// Initialize logger. A storage failure must not stop the connection from
+// being attempted — the logger object works unconfigured.
+const logger = new Logger(PRODUCT_NAME);
+await safeInit(PRODUCT_NAME, 'logger', () => logger.init(browser));
 logger.logAlways('[Background] Extension loaded (modular version)');
+
+// Local alias so every pre-connect step reads the same way
+const step = (name, fn) => safeInit(PRODUCT_NAME, name, fn, logger);
 
 // Read build timestamp (read once at startup)
 let buildTimestamp = null;
@@ -95,17 +110,17 @@ const dialogHandler = new DialogHandler(browserAdapter, logger);
 const consoleHandler = new ConsoleHandler(browserAdapter, logger);
 
 // Initialize icon manager
-iconManager.init();
+step('icon manager', () => iconManager.init());
 
 // Initialize network tracker
-networkTracker.init();
+step('network tracker', () => networkTracker.init());
 
 // State variables
 let techStackInfo = {}; // Stores detected tech stack per tab
 let pendingDialogResponse = null; // Stores response for next dialog
 
 // Set up console message listener from content script
-browser.runtime.onMessage.addListener(async (message, sender) => {
+const onRuntimeMessage = async (message, sender) => {
   if (message.type === 'console' && sender.tab) {
     consoleHandler.addMessage({
       tabId: sender.tab.id,
@@ -167,14 +182,17 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
     await browser.tabs.update(sender.tab.id, { active: true });
     await browser.windows.update(sender.tab.windowId, { focused: true });
   }
-});
+};
+step('runtime message listener', () => browser.runtime.onMessage.addListener(onRuntimeMessage));
 
 // Set up console and dialog injectors for tab handlers
-tabHandlers.setConsoleInjector((tabId) => consoleHandler.injectConsoleCapture(tabId));
-tabHandlers.setDialogInjector((tabId) => dialogHandler.setupDialogOverrides(tabId));
+step('injectors', () => {
+  tabHandlers.setConsoleInjector((tabId) => consoleHandler.injectConsoleCapture(tabId));
+  tabHandlers.setDialogInjector((tabId) => dialogHandler.setupDialogOverrides(tabId));
+});
 
 // Listen for tab navigation to re-inject dialog overrides
-browser.webNavigation.onCompleted.addListener(async (details) => {
+const onNavigationCompleted = async (details) => {
   const attachedTabId = tabHandlers.getAttachedTabId();
 
   if (details.tabId === attachedTabId && details.frameId === 0) {
@@ -182,16 +200,17 @@ browser.webNavigation.onCompleted.addListener(async (details) => {
     await consoleHandler.injectConsoleCapture(details.tabId);
     await dialogHandler.setupDialogOverrides(details.tabId);
   }
-});
+};
+step('navigation listener', () => browser.webNavigation.onCompleted.addListener(onNavigationCompleted));
 
 // Tab-close cleanup is shared across browsers
-registerTabCleanup(browser, {
+step('tab cleanup', () => registerTabCleanup(browser, {
   tabHandlers,
   networkTracker,
   consoleHandler,
   techStackInfo,
   logger
-});
+}));
 
 // Initialize WebSocket connection
 const wsConnection = new WebSocketConnection(browser, logger, iconManager, buildTimestamp);
@@ -233,12 +252,12 @@ wsConnection.registerCommandHandler('openTestPage', async () => {
 
 // Network/console read+clear handlers are shared across browsers (Firefox
 // has no CDP capture, so the webRequest tracker is the only source)
-registerCaptureCommandHandlers(wsConnection, {
+step('capture commands', () => registerCaptureCommandHandlers(wsConnection, {
   tabHandlers,
   networkTracker,
   consoleHandler,
   logger
-});
+}));
 
 wsConnection.registerCommandHandler('forwardCDPCommand', async (params) => {
   return await handleCDPCommand(params);
@@ -665,8 +684,9 @@ async function handleOpenTestPage() {
     active: true
   });
 
-  // Wait for page to load
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  // Attach to the new tab so the extension agrees with the server's
+  // reported attachment (otherwise later commands hit the previous tab)
+  await tabHandlers.attachToTabId(tab.id);
 
   return {
     tab: { id: tab.id, url: tab.url },
@@ -721,6 +741,4 @@ function buildTechStackMessage(detectedStack) {
 
 logger.logAlways('[Background] Background script initialized with modular architecture');
 
-})().catch(error => {
-  console.error('[Background] Initialization failed:', error);
-});
+})(), PRODUCT_NAME);

@@ -18,38 +18,49 @@ import { ConsoleHandler } from '../../shared/handlers/console.js';
 import { createBrowserAdapter } from '../../shared/adapters/browser.js';
 import { wrapWithUnwrap, shouldUnwrap } from '../../shared/utils/unwrap.js';
 import { setupInstallHandler } from '../../shared/handlers/install.js';
+import { safeInit, reportFatalInit } from '../../shared/utils/safeInit.js';
 
 // Initialize browser adapter at top level (before async IIFE)
 const browserAdapter = createBrowserAdapter();
 const chrome = browserAdapter.getRawAPI();
 
-// Set up welcome page to open on first install (must be at top level for MV3)
-// Browser name is auto-detected from manifest.json
-setupInstallHandler(chrome);
+const PRODUCT_NAME = 'Blueprint MCP for Chrome';
+
+// Top-level init steps are individually guarded: a throw here would kill
+// the service worker before the connection code ever runs, leaving the
+// extension permanently "Connecting…" with no product-prefixed error
+// (the failure mode reported for Firefox in issue #49)
+safeInit(PRODUCT_NAME, 'install handler', () => {
+  // Set up welcome page to open on first install (must be at top level for MV3)
+  // Browser name is auto-detected from manifest.json
+  setupInstallHandler(chrome);
+});
 
 // Top-level variables for tab monitoring
 let tabHandlers = null;
 let wsConnection = null;
 
-// Write to storage immediately to confirm script is loading
-chrome.storage.local.set({
-  backgroundScriptLoaded: {
-    timestamp: new Date().toISOString(),
-    message: 'Background script loaded successfully!'
-  }
+safeInit(PRODUCT_NAME, 'startup storage markers', () => {
+  // Write to storage immediately to confirm script is loading
+  chrome.storage.local.set({
+    backgroundScriptLoaded: {
+      timestamp: new Date().toISOString(),
+      message: 'Background script loaded successfully!'
+    }
+  });
+
+  // Also write to storage to confirm listener is being registered
+  chrome.storage.local.set({
+    listenerRegistered: {
+      timestamp: new Date().toISOString(),
+      message: 'tabs.onUpdated listener registered!'
+    }
+  });
 });
 
 // Register tabs.onUpdated listener at TOP LEVEL (not inside async function)
 // This ensures it persists through service worker suspensions in MV3
 console.error('[Background] ⚡ Registering tabs.onUpdated listener at TOP LEVEL...');
-
-// Also write to storage to confirm listener is being registered
-chrome.storage.local.set({
-  listenerRegistered: {
-    timestamp: new Date().toISOString(),
-    message: 'tabs.onUpdated listener registered!'
-  }
-});
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Check if tabHandlers is initialized yet
@@ -115,15 +126,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 console.error('[Background] ✅ tabs.onUpdated listener registered at TOP LEVEL!');
 
 // Main initialization
-(async () => {
+// The catch below is the line to look for when the extension never connects
+reportFatalInit((async () => {
 
 // Note: Use browserAdapter.executeScript instead of defining a local executeScript
 // The browserAdapter version properly handles both 'func' and 'code' parameters
 // and avoids CSP issues by not using eval() when possible
 
-// Initialize logger
-const logger = new Logger('Blueprint MCP for Chrome');
-await logger.init(chrome);
+// Initialize logger. A storage failure must not stop the connection from
+// being attempted — the logger object works unconfigured.
+const logger = new Logger(PRODUCT_NAME);
+await safeInit(PRODUCT_NAME, 'logger', () => logger.init(chrome));
 const manifest = chrome.runtime.getManifest();
 logger.logAlways(`Blueprint MCP v${manifest.version}`);
 
@@ -159,10 +172,10 @@ tabHandlers.setDialogInjector((tabId) => dialogHandler.setupDialogOverrides(tabI
 consoleHandler.setupMessageListener();
 
 // Initialize icon manager
-iconManager.init();
+safeInit(PRODUCT_NAME, 'icon manager', () => iconManager.init(), logger);
 
 // Initialize network tracker
-networkTracker.init();
+safeInit(PRODUCT_NAME, 'network tracker', () => networkTracker.init(), logger);
 
 // State variables
 let techStackInfo = {}; // Stores detected tech stack per tab
@@ -536,9 +549,10 @@ async function enableCaptureDomains(tabId, session) {
 // shrinks again as sessions go idle.
 // Accepted tradeoff: a single command running longer than the idle window
 // on a tab that is no longer the attached target can have its session
-// evicted mid-command (the command fails with "Detached while handling
-// command" and retries cleanly). Tracking per-command pins proved more
-// error-prone than this window (see history in the PR).
+// evicted mid-command — the command fails with "Detached while handling
+// command" and the error surfaces to the caller (nothing retries it
+// automatically; the next command re-attaches lazily). Tracking
+// per-command pins proved more error-prone than this window.
 let evictionRetryTimer = null;
 
 function evictLeastRecentlyUsedSessions(protectedTabId) {
@@ -697,15 +711,13 @@ async function dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId) {
     case 'Target.getTargets':
       return await tabHandlers.getTabs();
 
-    case 'Target.attachToTarget': {
-      const tabId = cdpParams.targetId;
-      return await tabHandlers.selectTab(parseInt(tabId));
-    }
+    // These handlers take params objects; passing bare values silently
+    // selected nothing / opened about:blank
+    case 'Target.attachToTarget':
+      return await tabHandlers.selectTab({ tabIndex: parseInt(cdpParams.targetId, 10) });
 
-    case 'Target.createTarget': {
-      const url = cdpParams.url || 'about:blank';
-      return await tabHandlers.createTab(url);
-    }
+    case 'Target.createTarget':
+      return await tabHandlers.createTab({ url: cdpParams.url || 'about:blank' });
 
     case 'Target.closeTarget': {
       const tabId = cdpParams.targetId;
@@ -1910,11 +1922,19 @@ wsConnection.registerCommandHandler('openTestPage', async () => {
     height: 900
   });
 
+  const tabId = window.tabs[0].id;
+
+  // Attach to the new tab. The server reports this page as attached, so
+  // the extension must agree — otherwise every following command runs
+  // against the previously attached tab while the status header claims
+  // the test page.
+  await tabHandlers.attachToTabId(tabId);
+
   return {
     success: true,
     url: testPageUrl,
     windowId: window.id,
-    tabId: window.tabs[0].id
+    tabId
   };
 });
 
@@ -2073,4 +2093,4 @@ if (isEnabled) {
 }
 
 // End of main initialization
-})();
+})(), PRODUCT_NAME);

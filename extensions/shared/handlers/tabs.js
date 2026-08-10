@@ -92,32 +92,64 @@ export class TabHandlers {
    * Handle getTabs command
    * Returns list of all tabs from all windows
    */
-  async getTabs() {
-    // Get all tabs from all windows
+  /**
+   * All tabs in the one canonical user-facing order: windows.getAll
+   * flattening. Every index shown to or accepted from the user MUST
+   * resolve through this list — tabs.query({}) orders (and filters
+   * window types) differently, so mixing the two could map a listed
+   * index onto a different tab when attaching or closing.
+   */
+  async getOrderedTabs() {
     const windows = await this.browser.windows.getAll({ populate: true });
-    const tabs = [];
-    let tabIndex = 0;
+    return windows.flatMap(window => window.tabs || []);
+  }
 
-    windows.forEach(window => {
-      window.tabs.forEach(tab => {
-        // Check if tab is automatable (not about:, moz-extension:, chrome:, etc.)
-        const isAutomatable = tab.url &&
-          !['about:', 'moz-extension:', 'chrome:', 'chrome-extension:'].some(scheme =>
-            tab.url.startsWith(scheme)
-          );
+  /**
+   * Attach to a tab by id, waiting for its URL to materialize. A tab
+   * created moments ago reports no URL yet, which the automatable check
+   * would reject — so callers that just opened a page poll briefly here
+   * instead of racing it.
+   * @param {number} tabId - Tab to attach to
+   * @param {object} options - { activate, timeoutMs }
+   */
+  async attachToTabId(tabId, { activate = true, timeoutMs = 5000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
 
-        tabs.push({
-          id: tab.id,
-          windowId: window.id,
-          title: tab.title,
-          url: tab.url,
-          active: tab.active,
-          index: tabIndex,
-          automatable: isAutomatable
-        });
+    while (Date.now() < deadline) {
+      const tab = await this.browser.tabs.get(tabId).catch(() => null);
+      if (tab && tab.url && tab.url !== 'about:blank') {
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
 
-        tabIndex++;
-      });
+    const orderedTabs = await this.getOrderedTabs();
+    const tabIndex = orderedTabs.findIndex(t => t.id === tabId);
+    if (tabIndex < 0) {
+      throw new Error(`Tab ${tabId} not found after opening`);
+    }
+    return this.selectTab({ tabIndex, activate });
+  }
+
+  async getTabs() {
+    const orderedTabs = await this.getOrderedTabs();
+
+    const tabs = orderedTabs.map((tab, tabIndex) => {
+      // Check if tab is automatable (not about:, moz-extension:, chrome:, etc.)
+      const isAutomatable = tab.url &&
+        !['about:', 'moz-extension:', 'chrome:', 'chrome-extension:'].some(scheme =>
+          tab.url.startsWith(scheme)
+        );
+
+      return {
+        id: tab.id,
+        windowId: tab.windowId,
+        title: tab.title,
+        url: tab.url,
+        active: tab.active,
+        index: tabIndex,
+        automatable: isAutomatable
+      };
     });
 
     return { tabs };
@@ -148,8 +180,9 @@ export class TabHandlers {
       this.logger.log(`[TabHandlers] Stored stealth=${stealth} for tab ${tab.id}`);
     }
 
-    // Get all tabs to find the index of the newly created tab
-    const allTabs = await this.browser.tabs.query({});
+    // Get all tabs to find the index of the newly created tab (canonical
+    // ordering, matching what getTabs reports)
+    const allTabs = await this.getOrderedTabs();
     const tabIndex = allTabs.findIndex(t => t.id === tab.id);
 
     // Clear badge from old tab if there was one
@@ -220,10 +253,13 @@ export class TabHandlers {
     const activate = params.activate ?? false; // Default to false - don't steal focus
     const stealth = params.stealth ?? false;
 
-    // Get all tabs
-    const allTabs = await this.browser.tabs.query({});
+    // Get all tabs in the canonical ordering, so the index the user saw
+    // in the listing resolves to the same tab here
+    const allTabs = await this.getOrderedTabs();
 
-    if (tabIndex < 0 || tabIndex >= allTabs.length) {
+    // Integer check included: a missing or fractional index would slip
+    // past a bare range test and fail later with an opaque TypeError
+    if (!Number.isInteger(tabIndex) || tabIndex < 0 || tabIndex >= allTabs.length) {
       throw new Error(`Tab index ${tabIndex} out of range (0-${allTabs.length - 1})`);
     }
 
@@ -310,16 +346,10 @@ export class TabHandlers {
     let wasAttached = false;
 
     if (index !== undefined) {
-      // Close tab by index - use same method as getTabs() to ensure consistent ordering
-      const windows = await this.browser.windows.getAll({ populate: true });
-      const allTabs = [];
-      windows.forEach(window => {
-        window.tabs.forEach(tab => {
-          allTabs.push(tab);
-        });
-      });
+      // Close tab by index, resolved through the canonical ordering
+      const allTabs = await this.getOrderedTabs();
 
-      if (index < 0 || index >= allTabs.length) {
+      if (!Number.isInteger(index) || index < 0 || index >= allTabs.length) {
         throw new Error(`Tab index ${index} out of range (0-${allTabs.length - 1})`);
       }
 
