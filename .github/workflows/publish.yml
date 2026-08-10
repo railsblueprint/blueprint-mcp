@@ -26,7 +26,7 @@ jobs:
           cache-dependency-path: 'server/package-lock.json'
       # Ensure npm 11.5.1 or later is installed (for OIDC npm publishing)
       - name: Update npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@^11.5.1
 
       - name: Get current date
         id: date
@@ -69,7 +69,7 @@ jobs:
           cache-dependency-path: 'server/package-lock.json'
       # Ensure npm 11.5.1 or later is installed (for OIDC npm publishing)
       - name: Update npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@^11.5.1
       - run: npm ci
       - run: npm run test
       - run: npm publish
@@ -85,6 +85,7 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
+          cache-dependency-path: 'extensions/chrome/package-lock.json'
       - name: Install extension dependencies
         working-directory: ./extensions/chrome
         run: npm ci
