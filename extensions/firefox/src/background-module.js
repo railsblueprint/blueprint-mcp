@@ -464,6 +464,133 @@ async function handleCDPCommand(params) {
       }
     }
 
+    case 'Accessibility.getFullAXTree': {
+      try {
+        const results = await executeScript(attachedTabId, {
+          code: `
+            (() => {
+              const maxLines = 200;
+              const lines = [];
+
+              const normalizeText = (value) => {
+                if (!value) return '';
+                return String(value).replace(/\\s+/g, ' ').trim();
+              };
+
+              const clip = (value, max = 80) => {
+                if (!value) return '';
+                return value.length > max ? value.substring(0, max - 1) + '…' : value;
+              };
+
+              const isSignificant = (el) => {
+                const tag = el.tagName.toLowerCase();
+                if (/^h[1-6]$/.test(tag)) return true;
+                if (['main', 'nav', 'header', 'footer', 'aside', 'form', 'article', 'section'].includes(tag)) return true;
+                if (el.matches('a, button, input, select, textarea, summary, [contenteditable="true"]')) return true;
+                if (el.hasAttribute('role')) return true;
+                const text = normalizeText(el.innerText || el.textContent);
+                return text.length > 0 && text.length <= 60 && el.children.length === 0;
+              };
+
+              const describe = (el) => {
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role') || tag;
+                const label = normalizeText(
+                  el.getAttribute('aria-label') ||
+                  el.getAttribute('title') ||
+                  (el.tagName === 'INPUT' ? el.getAttribute('placeholder') : '') ||
+                  el.innerText ||
+                  el.textContent
+                );
+                let line = role;
+                if (label) line += ': ' + clip(label);
+                return line;
+              };
+
+              const walk = (el, depth) => {
+                if (!(el instanceof Element)) return;
+                if (lines.length >= maxLines) return;
+
+                let nextDepth = depth;
+                if (isSignificant(el)) {
+                  lines.push('  '.repeat(depth) + describe(el));
+                  nextDepth = depth + 1;
+                }
+
+                for (const child of el.children) {
+                  if (lines.length >= maxLines) break;
+                  walk(child, nextDepth);
+                }
+              };
+
+              walk(document.body || document.documentElement, 0);
+
+              const totalLines = lines.length;
+              const truncated = totalLines >= maxLines;
+              return {
+                preFormatted: true,
+                text: totalLines > 0 ? lines.join('\\n') : 'document',
+                totalLines,
+                truncated,
+                truncationMessage: truncated ? 'Snapshot truncated at 200 lines' : null
+              };
+            })();
+          `
+        });
+
+        return {
+          formattedSnapshot: results[0] || {
+            preFormatted: true,
+            text: 'document',
+            totalLines: 1,
+            truncated: false
+          }
+        };
+      } catch (error) {
+        throw new Error(`Accessibility snapshot failed: ${error.message}`);
+      }
+    }
+
+    case 'Target.getTargetInfo': {
+      try {
+        const tab = await browser.tabs.get(attachedTabId);
+        const results = await executeScript(attachedTabId, {
+          code: `
+            (() => {
+              const perfData = window.performance.getEntriesByType('navigation')[0];
+              const paintData = window.performance.getEntriesByType('paint');
+              const fcp = paintData.find(p => p.name === 'first-contentful-paint');
+
+              return {
+                loadEventEnd: perfData ? Math.round(perfData.loadEventEnd) : 0,
+                domContentLoadedEventEnd: perfData ? Math.round(perfData.domContentLoadedEventEnd) : 0,
+                firstContentfulPaint: fcp ? Math.round(fcp.startTime) : 0,
+                url: window.location.href,
+                title: document.title
+              };
+            })();
+          `
+        });
+
+        return {
+          targetInfo: {
+            targetId: String(attachedTabId),
+            type: 'page',
+            title: tab.title,
+            url: tab.url,
+            attached: true
+          },
+          performance: results[0] || {}
+        };
+      } catch (error) {
+        throw new Error(`Get target info failed: ${error.message}`);
+      }
+    }
+
+    case 'Performance.getMetrics':
+      // Firefox extension mode does not expose CDP metrics; server calculates via Runtime.evaluate.
+      return { metrics: [] };
+
     default:
       throw new Error(`Unsupported CDP method: ${method}`);
   }
