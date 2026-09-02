@@ -797,7 +797,8 @@ async function dispatchCDPCommand(cdpMethod, cdpParams, attachedTabId) {
           'Runtime.evaluate',
           {
             expression: expression,
-            returnByValue: true
+            returnByValue: cdpParams.returnByValue ?? true,
+            awaitPromise: cdpParams.awaitPromise
           }
         );
 

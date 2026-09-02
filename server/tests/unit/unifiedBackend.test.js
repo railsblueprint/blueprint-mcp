@@ -1,3 +1,6 @@
+const { UnifiedBackend } = require('../../src/unifiedBackend');
+const { createMockTransport, mockCDPCommandRuntimeEvaluate } = require('../helpers/mocks')
+
 /**
  * Unit tests for UnifiedBackend - Selector Escaping
  *
@@ -132,6 +135,190 @@ describe('UnifiedBackend - Selector Escaping', () => {
       expect(() => {
         eval(code);
       }).not.toThrow();
+    });
+  });
+});
+
+describe('UnifiedBackend - _handleEvaluate()', () => {
+  const evalOptions = {
+    rawResult: true
+  };
+  let unifiedBackend;
+
+  beforeAll(() => {
+    jest.useFakeTimers()
+  });
+
+  afterAll(() => {
+    jest.useRealTimers()
+  });
+
+  beforeEach(async () => {
+    const mockTransport = {
+      ...createMockTransport(),
+      sendCommand: jest.fn(async (_, params) => {
+        return await mockCDPCommandRuntimeEvaluate(params)
+      })
+    };
+
+    unifiedBackend = new UnifiedBackend({ debug: false }, mockTransport);
+  });
+
+  test('handles expression that returns a primitive value', async () => {
+    const result = await unifiedBackend._handleEvaluate(
+      {
+        expression: `40 + 2`
+      },
+      evalOptions
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.value).toStrictEqual(42);
+  });
+
+  test('handles expression that returns an object', async () => {
+    const result = await unifiedBackend._handleEvaluate(
+      {
+        expression: `({ prop: 40 + 2 })`
+      },
+      evalOptions
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.value).toStrictEqual({ prop: 42 });
+  })
+
+  test('handles traditional function', async () => {
+    const result = await unifiedBackend._handleEvaluate(
+      {
+        function: `
+          function () {
+            return { prop: 40 + 2 };
+          }
+        `
+      },
+      evalOptions
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.value).toStrictEqual({ prop: 42 });
+  })
+
+  test('handles arrow function', async () => {
+    const result = await unifiedBackend._handleEvaluate(
+      {
+        function: `() => ({ prop: 40 + 2 })`
+      },
+      evalOptions
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.value).toStrictEqual({ prop: 42 });
+  });
+
+  test('handles traditional async function', async () => {
+    const result = await unifiedBackend._handleEvaluate(
+      {
+        function: `
+          async function () {
+            return { prop: 40 + 2 };
+          }
+        `
+      },
+      evalOptions
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.value).toStrictEqual({ prop: 42 });
+  });
+
+  test('handles arrow async function', async () => {
+    const result = await unifiedBackend._handleEvaluate(
+      {
+        function: `async () => ({ prop: 40 + 2 })`
+      },
+      evalOptions
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.value).toStrictEqual({ prop: 42 });
+  });
+
+  describe('handles function expression as a function', () => {
+    const functionExpressions = [
+      'function() { return { prop: 40 + 2 } }',
+      'function () { return { prop: 40 + 2 } }',
+      'function xyz() { return { prop: 40 + 2 } }',
+      '() => ({ prop: 40 + 2 })',
+      'async() => ({ prop: 40 + 2 })',
+      'async() =>({ prop: 40 + 2 })',
+      'async _param => ({ prop: 40 + 2 })',
+      'async _param=> ({ prop: 40 + 2 })',
+      'async () => ({ prop: 40 + 2 })',
+      'async () =>({ prop: 40 + 2 })',
+      `
+        function () {
+          return { prop: 40 + 2 }
+        }
+      `
+    ];
+
+    for (const functionExpression of functionExpressions) {
+      test(`expression: '${functionExpression}'`, async () => {
+        const result = await unifiedBackend._handleEvaluate(
+          { expression: functionExpression },
+          evalOptions
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.value).toStrictEqual({ prop: 42 });
+      });
+    }
+  });
+
+  describe('handles function with timeout', () => {
+    test('success case', async () => {
+      const timeout = 200;
+      const duration = 100;
+
+      const promise = unifiedBackend._handleEvaluate(
+        {
+          expression: `
+            new Promise(resolve => setTimeout(() => resolve(42), ${duration}))
+          `,
+          timeout
+        },
+        evalOptions
+      );
+
+      jest.runAllTimers();
+      const result = await promise;
+  
+      jest.runAllTimers();
+      expect(result.success).toBe(true);
+      expect(result.value).toBe(42);
+    });
+
+    test('timeout case', async () => {
+      const timeout = 100;
+      const duration = 200;
+  
+      const promise = unifiedBackend._handleEvaluate(
+        {
+          expression: `
+            new Promise(resolve => setTimeout(() => resolve(42), ${duration}))
+          `,
+          timeout
+        },
+        evalOptions
+      );
+
+      jest.runAllTimers();
+      const result = await promise;
+  
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('timeout');
+      expect(result.message).toContain(String(timeout));
     });
   });
 });
