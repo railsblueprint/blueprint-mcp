@@ -61,24 +61,30 @@ reportFatalInit((async () => {
  * @returns {Promise<Array>} Array of execution results
  */
 async function executeScript(tabId, options) {
-  if (browser.scripting && browser.scripting.executeScript) {
-    // Use MAIN world (Firefox 128+) - NOT blocked by page CSP
-    // Official Firefox approach for executing arbitrary code
-    const results = await browser.scripting.executeScript({
-      target: { tabId: tabId },
-      world: 'MAIN',  // Run in page world - page CSP does not apply!
-      func: (code) => {
-        // In MAIN world, eval is allowed even on CSP-strict pages
-        return eval(code);
-      },
-      args: [options.code]
-    });
-
-    // Return results in the same format as old tabs.executeScript
-    return results.map(r => r.result);
+  // Firefox's browser.scripting.executeScript is unreliable for injected code
+  // here (it rejects with a generic error regardless of world/args), so we
+  // route evaluation through the content script, which relays the code to the
+  // page's own JS context via window.postMessage and returns the result. The
+  // content script serializes the result into a tagged wrapper so it survives
+  // messaging; we parse it back into a real value here.
+  let out;
+  try {
+    out = await browser.tabs.sendMessage(tabId, { type: '__bpEval', code: options.code });
+  } catch (e) {
+    throw new Error(
+      'Could not reach the page eval relay (content script not present on this tab). ' +
+      (e && e.message ? e.message : String(e))
+    );
   }
 
-  throw new Error('No executeScript API available - scripting permission may be missing');
+  if (out && out.__bpUndefined) return [undefined];
+  if (out && Object.prototype.hasOwnProperty.call(out, '__bpError')) {
+    throw new Error(out.__bpError);
+  }
+  if (out && Object.prototype.hasOwnProperty.call(out, '__bpValue')) {
+    return [out.__bpValue];
+  }
+  return [out];
 }
 
 // Initialize logger. A storage failure must not stop the connection from
