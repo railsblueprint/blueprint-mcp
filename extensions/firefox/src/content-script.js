@@ -298,3 +298,82 @@ if (window.Turbo) {
     setTimeout(sendTechStackDetection, 100);
   });
 }
+
+// ── Page-context eval relay (fix for browser_evaluate on Firefox) ──────────
+// scripting.executeScript is unreliable here, so the background relays eval
+// requests to this content script, which forwards them to the PAGE world via
+// window.postMessage and returns the JSON-serialized result.
+(function installEvalRelay() {
+  // Install the page-world listener by injecting a script element. This runs
+  // in the page's own JS context (has access to page globals) and communicates
+  // back via window.postMessage.
+  try {
+    const pageScript = document.createElement('script');
+    pageScript.textContent = '(' + function () {
+      window.addEventListener('message', function (event) {
+        if (event.source !== window) return;
+        var d = event.data;
+        if (!d || d.__bpEvalReq !== true) return;
+        var out;
+        try {
+          // eslint-disable-next-line no-eval
+          var value = (0, eval)(d.code);
+          if (typeof value === 'undefined') {
+            out = { __bpUndefined: true };
+          } else {
+            try { JSON.stringify(value); out = { __bpValue: value }; }
+            catch (e) { out = { __bpValue: String(value) }; }
+          }
+        } catch (e) {
+          out = { __bpError: (e && e.message) ? e.message : String(e) };
+        }
+        window.postMessage({ __bpEvalRes: true, id: d.id, out: out }, '*');
+      }, false);
+    }.toString() + ')();';
+    (document.head || document.documentElement).appendChild(pageScript);
+    pageScript.remove();
+  } catch (e) {
+    // If CSP blocks the page-world injection, we fall back to isolated-world
+    // eval below (DOM access still works for most read expressions).
+  }
+
+  var pending = {};
+  window.addEventListener('message', function (event) {
+    if (event.source !== window) return;
+    var d = event.data;
+    if (!d || d.__bpEvalRes !== true) return;
+    var cb = pending[d.id];
+    if (cb) { delete pending[d.id]; cb(d.out); }
+  }, false);
+
+  function evalInPage(code) {
+    return new Promise(function (resolve) {
+      var id = 'bp_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      var settled = false;
+      pending[id] = function (out) { settled = true; resolve(out); };
+      window.postMessage({ __bpEvalReq: true, id: id, code: code }, '*');
+      // Fallback: if the page-world listener never answers (e.g. CSP blocked
+      // the injection), try eval in the isolated content-script world, which
+      // still has DOM access for read-style expressions.
+      setTimeout(function () {
+        if (settled) return;
+        delete pending[id];
+        try {
+          // eslint-disable-next-line no-eval
+          var v = (0, eval)(code);
+          if (typeof v === 'undefined') resolve({ __bpUndefined: true });
+          else { try { JSON.stringify(v); resolve({ __bpValue: v }); } catch (e) { resolve({ __bpValue: String(v) }); } }
+        } catch (e) {
+          resolve({ __bpError: (e && e.message) ? e.message : String(e) });
+        }
+      }, 250);
+    });
+  }
+
+  browser.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+    if (msg && msg.type === '__bpEval') {
+      evalInPage(msg.code).then(function (out) { sendResponse(out); });
+      return true; // async response
+    }
+  });
+})();
