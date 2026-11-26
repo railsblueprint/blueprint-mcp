@@ -24,11 +24,28 @@ window.addEventListener('message', (event) => {
   }
 });
 
+// Pages allowed to hand login tokens to the extension.
+// Keep in sync with TRUSTED_HOSTS in shared/utils/trust.js
+// (content scripts cannot import ES modules). The background script
+// re-checks sender.url, this guard just keeps the watcher off other sites.
+const TRUSTED_LOGIN_HOSTS = [
+  'mcp-for-chrome.railsblueprint.com',
+  'mcp-for-firefox.railsblueprint.com',
+  'mcp-for-edge.railsblueprint.com',
+  'mcp-for-safari.railsblueprint.com',
+  'mcp-for-brave.railsblueprint.com',
+  'blueprint-mcp.railsblueprint.com'
+];
+const isTrustedLoginPage = window.location.protocol === 'https:' &&
+  TRUSTED_LOGIN_HOSTS.includes(window.location.hostname);
+
 // Watch for a div with class 'mcp-extension-tokens' containing data attributes
+let focusRequested = false;
 const observer = new MutationObserver(() => {
   // Check for focus request
   const focusElement = document.querySelector('.mcp-extension-focus-tab');
-  if (focusElement) {
+  if (focusElement && !focusRequested) {
+    focusRequested = true; // once per page, don't steal focus on later DOM changes
     console.log('[Content Script] Focus request detected, focusing tab...');
     chrome.runtime.sendMessage({ type: 'focusTab' });
     // Don't disconnect - we still need to watch for tokens
@@ -63,11 +80,13 @@ const observer = new MutationObserver(() => {
   }
 });
 
-// Start observing the document for changes
-observer.observe(document.documentElement, {
-  childList: true,
-  subtree: true
-});
+// Start observing the document for changes (our own login pages only)
+if (isTrustedLoginPage) {
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+}
 
 // Silently watching for login tokens
 

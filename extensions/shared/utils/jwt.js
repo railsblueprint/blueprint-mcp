@@ -6,7 +6,57 @@
  * Validation happens server-side.
  */
 
+import { isTrustedRelayUrl } from './trust.js';
+
 const API_HOST = 'https://mcp-for-chrome.railsblueprint.com';
+const TOKEN_KEYS = ['accessToken', 'refreshToken', 'isPro'];
+
+/**
+ * Build user info from a decoded payload.
+ * Returns null if the token points at a relay we do not operate:
+ * the payload is unverified, so connection_url must be allow-listed.
+ */
+function userInfoFromPayload(payload) {
+  if (!payload) return null;
+
+  const connectionUrl = payload.connection_url || null;
+  if (connectionUrl && !isTrustedRelayUrl(connectionUrl)) {
+    console.error('[JWT] Rejecting token with untrusted connection_url:', connectionUrl);
+    return null;
+  }
+
+  return {
+    email: payload.email || payload.sub || null,
+    sub: payload.sub,
+    connectionUrl, // PRO mode relay URL
+  };
+}
+
+/**
+ * Check whether a token may be stored by the extension.
+ * Tokens must decode and must not name an untrusted relay.
+ */
+export function isAcceptableToken(token) {
+  if (typeof token !== 'string') return false;
+  return userInfoFromPayload(decodeJWT(token)) !== null;
+}
+
+/**
+ * Remove stored tokens that point at an untrusted relay.
+ * Run on startup to clean up tokens planted by older versions.
+ * @returns {Promise<boolean>} True if tokens were removed
+ */
+export async function purgeUntrustedTokens(browserAPI) {
+  const result = await browserAPI.storage.local.get(['accessToken', 'refreshToken']);
+  const stored = [result.accessToken, result.refreshToken].filter(Boolean);
+  if (stored.length === 0) return false;
+
+  if (stored.every(isAcceptableToken)) return false;
+
+  console.error('[JWT] Stored tokens failed validation, clearing them');
+  await browserAPI.storage.local.remove(TOKEN_KEYS);
+  return true;
+}
 
 /**
  * Decode a JWT token and extract the payload
@@ -63,39 +113,33 @@ export async function getUserInfoFromStorage(browserAPI) {
       });
 
       // Decode the NEW fresh token
-      const payload = decodeJWT(newTokens.access_token);
+      const info = userInfoFromPayload(decodeJWT(newTokens.access_token));
 
-      if (!payload) {
-        console.error('[JWT] Failed to decode refreshed token');
+      if (!info) {
+        console.error('[JWT] Refreshed token is invalid');
+        await browserAPI.storage.local.remove(TOKEN_KEYS);
         return null;
       }
 
-      return {
-        email: payload.email || payload.sub || null,
-        sub: payload.sub,
-        connectionUrl: payload.connection_url || null, // PRO mode relay URL
-      };
+      return info;
 
     } catch (error) {
       console.error('[JWT] ❌ Token refresh failed:', error);
       // Clear invalid tokens on refresh failure
-      await browserAPI.storage.local.remove(['accessToken', 'refreshToken', 'isPro']);
+      await browserAPI.storage.local.remove(TOKEN_KEYS);
       return null;
     }
   }
 
   // Token is still valid, decode and return it
-  const payload = decodeJWT(result.accessToken);
+  const info = userInfoFromPayload(decodeJWT(result.accessToken));
 
-  if (!payload) {
+  if (!info) {
+    await browserAPI.storage.local.remove(TOKEN_KEYS);
     return null;
   }
 
-  return {
-    email: payload.email || payload.sub || null,
-    sub: payload.sub,
-    connectionUrl: payload.connection_url || null, // PRO mode relay URL
-  };
+  return info;
 }
 
 /**

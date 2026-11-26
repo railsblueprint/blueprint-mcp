@@ -19,6 +19,8 @@ import { createBrowserAdapter } from '../shared/adapters/browser.js';
 import { wrapWithUnwrap, shouldUnwrap } from '../shared/utils/unwrap.js';
 import { setupInstallHandler } from '../shared/handlers/install.js';
 import { safeInit, reportFatalInit } from '../shared/utils/safeInit.js';
+import { isTrustedSiteUrl } from '../shared/utils/trust.js';
+import { isAcceptableToken, purgeUntrustedTokens } from '../shared/utils/jwt.js';
 
 // Initialize browser adapter at top level (before async IIFE) for install handler
 const browserAdapter = createBrowserAdapter();
@@ -149,6 +151,16 @@ const onRuntimeMessage = async (message, sender) => {
 
   // Handle OAuth login success from content script
   if (message.type === 'loginSuccess') {
+    // Only our own login page may hand over tokens. sender.url is set by
+    // the browser and cannot be forged by the page.
+    if (!sender.tab || !isTrustedSiteUrl(sender.url)) {
+      logger.logAlways('[Background] Rejected loginSuccess from untrusted sender:', sender.url);
+      return { success: false, error: 'untrusted sender' };
+    }
+    if (!isAcceptableToken(message.accessToken) || !isAcceptableToken(message.refreshToken)) {
+      logger.logAlways('[Background] Rejected loginSuccess with invalid tokens');
+      return { success: false, error: 'invalid tokens' };
+    }
     logger.logAlways('[Background] Login success - saving tokens');
     await browser.storage.local.set({
       accessToken: message.accessToken,
@@ -177,7 +189,7 @@ const onRuntimeMessage = async (message, sender) => {
   }
 
   // Handle focus tab request from content script
-  if (message.type === 'focusTab' && sender.tab) {
+  if (message.type === 'focusTab' && sender.tab && isTrustedSiteUrl(sender.url)) {
     logger.log('[Background] Focus tab request');
     await browser.tabs.update(sender.tab.id, { active: true });
     await browser.windows.update(sender.tab.windowId, { focused: true });
@@ -274,6 +286,16 @@ wsConnection.registerCommandHandler('reloadExtensions', async (params) => {
 wsConnection.registerCommandHandler('openTestPage', async () => {
   return await handleOpenTestPage();
 });
+
+// Drop tokens that point at an untrusted relay (e.g. planted by a web page
+// through the old unrestricted login watcher) before the first connect
+try {
+  if (await purgeUntrustedTokens(browser)) {
+    logger.logAlways('[Background] Cleared untrusted stored tokens');
+  }
+} catch (error) {
+  logger.logAlways('[Background] Token check failed:', error);
+}
 
 // Start connection
 wsConnection.connect();
