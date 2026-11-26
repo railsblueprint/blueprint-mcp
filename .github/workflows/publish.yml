@@ -1,6 +1,11 @@
 name: Publish
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g. v1.9.23). Leave empty to publish a canary build.'
+        required: false
+        default: ''
   schedule:
     - cron: '0 8 * * *'
   release:
@@ -8,7 +13,7 @@ on:
 
 jobs:
   publish-canary-npm:
-    if: github.event.schedule || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule || (github.event_name == 'workflow_dispatch' && inputs.release_tag == '')
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -51,7 +56,7 @@ jobs:
         run: npm publish --tag next
 
   publish-release-npm:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -59,8 +64,12 @@ jobs:
     permissions:
       contents: read
       id-token: write  # Required for OIDC npm publishing
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-node@v5
         with:
           node-version: 20
@@ -70,17 +79,23 @@ jobs:
       # Ensure npm 11.5.1 or later is installed (for OIDC npm publishing)
       - name: Update npm
         run: npm install -g npm@^11.5.1
+      - name: Check that the package version matches the release tag
+        run: test "v$(node -p "require('./package.json').version")" = "$RELEASE_TAG"
       - run: npm ci
       - run: npm run test
       - run: npm publish
 
   package-release-extension:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write # Needed to upload release assets
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-node@v5
         with:
           node-version: 20
@@ -106,4 +121,4 @@ jobs:
         env:
            GITHUB_TOKEN: ${{ github.token }}
         run: |
-            gh release upload ${{github.event.release.tag_name}} ./extensions/chrome/blueprint-mcp-extension-${{ steps.get-version.outputs.version }}.zip
+            gh release upload "$RELEASE_TAG" --clobber ./extensions/chrome/blueprint-mcp-extension-${{ steps.get-version.outputs.version }}.zip
