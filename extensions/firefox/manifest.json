@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extName__",
-  "version": "1.9.22",
+  "version": "1.9.23",
   "description": "__MSG_extDescription__",
   "default_locale": "en",
   "browser_specific_settings": {
@@ -25,7 +25,7 @@
     "*://*.blueprintmcp.com/*"
   ],
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; connect-src ws://127.0.0.1:* wss://* https://* http://127.0.0.1:*;"
+    "extension_pages": "default-src 'self'; connect-src ws://127.0.0.1:* wss://mcp-for-chrome.railsblueprint.com wss://mcp-for-firefox.railsblueprint.com wss://mcp-for-edge.railsblueprint.com wss://mcp-for-safari.railsblueprint.com wss://mcp-for-brave.railsblueprint.com wss://blueprint-mcp.railsblueprint.com https://* http://127.0.0.1:*;"
   },
   "background": {
     "scripts": [

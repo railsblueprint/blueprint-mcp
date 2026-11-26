@@ -1,3 +1,10 @@
+# v1.9.23 (2026-11-26)
+
+## Changes
+
+- Harden extension login and relay connection handling (#58)
+
+
 # v1.9.22 (2026-08-10)
 
 ## Changes

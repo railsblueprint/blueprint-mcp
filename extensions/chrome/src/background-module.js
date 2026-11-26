@@ -19,6 +19,8 @@ import { createBrowserAdapter } from '../../shared/adapters/browser.js';
 import { wrapWithUnwrap, shouldUnwrap } from '../../shared/utils/unwrap.js';
 import { setupInstallHandler } from '../../shared/handlers/install.js';
 import { safeInit, reportFatalInit } from '../../shared/utils/safeInit.js';
+import { isTrustedSiteUrl } from '../../shared/utils/trust.js';
+import { isAcceptableToken, purgeUntrustedTokens } from '../../shared/utils/jwt.js';
 
 // Initialize browser adapter at top level (before async IIFE)
 const browserAdapter = createBrowserAdapter();
@@ -369,6 +371,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       // Handle OAuth login success from content script
       if (message.type === 'loginSuccess') {
+        // Only our own login page may hand over tokens. sender.url is set by
+        // the browser and cannot be forged by the page.
+        if (!sender.tab || !isTrustedSiteUrl(sender.url)) {
+          logger.logAlways('[Background] Rejected loginSuccess from untrusted sender:', sender.url);
+          sendResponse({ success: false, error: 'untrusted sender' });
+          return;
+        }
+        if (!isAcceptableToken(message.accessToken) || !isAcceptableToken(message.refreshToken)) {
+          logger.logAlways('[Background] Rejected loginSuccess with invalid tokens');
+          sendResponse({ success: false, error: 'invalid tokens' });
+          return;
+        }
         logger.logAlways('[Background] Login success - saving tokens');
         await chrome.storage.local.set({
           accessToken: message.accessToken,
@@ -381,6 +395,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         wsConnection.disconnect();
         await wsConnection.connect();
 
+        sendResponse({ success: true });
+        return;
+      }
+
+      // Bring our login tab to the front (the popup opens it in the background).
+      // Only our own pages may request this.
+      if (message.type === 'focusTab') {
+        if (!sender.tab || !isTrustedSiteUrl(sender.url)) {
+          sendResponse({ success: false, error: 'untrusted sender' });
+          return;
+        }
+        logger.log('[Background] Focus tab request');
+        await chrome.tabs.update(sender.tab.id, { active: true });
+        await chrome.windows.update(sender.tab.windowId, { focused: true });
         sendResponse({ success: true });
         return;
       }
@@ -2080,6 +2108,16 @@ chrome.storage.onChanged.addListener(async (changes, areaName) => {
     }
   }
 });
+
+// Drop tokens that point at an untrusted relay (e.g. planted by a web page
+// through the old unrestricted login watcher) before the first connect
+try {
+  if (await purgeUntrustedTokens(chrome)) {
+    logger.logAlways('[Background] Cleared untrusted stored tokens');
+  }
+} catch (error) {
+  logger.logAlways('[Background] Token check failed:', error);
+}
 
 // Check if extension is enabled before connecting on startup
 const storage = await chrome.storage.local.get(['extensionEnabled']);
