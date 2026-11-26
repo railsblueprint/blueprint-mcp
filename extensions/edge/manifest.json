@@ -20,6 +20,9 @@
     "*://*.railsblueprint.com/*",
     "*://*.blueprintmcp.com/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:* https://* wss://mcp-for-chrome.railsblueprint.com wss://mcp-for-firefox.railsblueprint.com wss://mcp-for-edge.railsblueprint.com wss://mcp-for-safari.railsblueprint.com wss://mcp-for-brave.railsblueprint.com wss://blueprint-mcp.railsblueprint.com;"
+  },
   "background": {
     "service_worker": "src/background-module.js",
     "type": "module"

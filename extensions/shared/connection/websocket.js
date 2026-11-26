@@ -4,6 +4,7 @@
  */
 
 import { getUserInfoFromStorage, decodeJWT, refreshAccessToken } from '../utils/jwt.js';
+import { isTrustedRelayUrl } from '../utils/trust.js';
 
 /**
  * WebSocket connection manager class
@@ -215,7 +216,9 @@ export class WebSocketConnection {
     // Debug: Log what we got from JWT
     this.logger.log('[WebSocket] User info from JWT:', userInfo);
 
-    if (userInfo && userInfo.connectionUrl) {
+    // getUserInfoFromStorage already rejects untrusted relays; check again
+    // here so no code path can hand an arbitrary URL to the WebSocket
+    if (userInfo && userInfo.connectionUrl && isTrustedRelayUrl(userInfo.connectionUrl)) {
       // PRO user: use connection URL from JWT token
       this.isPro = true;
       this.logger.log(`[WebSocket] PRO mode: Connecting to relay server ${userInfo.connectionUrl}`);

@@ -17,6 +17,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "lint": "eslint src/*.js --max-warnings=0",
+    "test": "node --test tests/unit/*.test.mjs",
     "build": "npm run lint && node ../build-chrome.js",
     "clean": "rm -rf ../../dist/chrome"
   },
