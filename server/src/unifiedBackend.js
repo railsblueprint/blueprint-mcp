@@ -3034,12 +3034,16 @@ class UnifiedBackend {
    * standard inputs use for insertion.
    */
   _keyEventParamsForChar(char) {
-    // US layout: unshifted char -> [code, shifted char]
+    // US layout: unshifted char -> [code, shifted char, Windows virtual key code].
+    // Punctuation keys use the VK_OEM_* codes; their ASCII values collide
+    // with other keys ('.' is 46 = Delete, "'" is 39 = ArrowRight, '-' is
+    // 45 = Insert), which makes the browser run that key's action instead
+    // of inserting the character.
     const KEY_LAYOUT = {
-      '`': ['Backquote', '~'], '-': ['Minus', '_'], '=': ['Equal', '+'],
-      '[': ['BracketLeft', '{'], ']': ['BracketRight', '}'], '\\': ['Backslash', '|'],
-      ';': ['Semicolon', ':'], "'": ['Quote', '"'], ',': ['Comma', '<'],
-      '.': ['Period', '>'], '/': ['Slash', '?'], ' ': ['Space', ' ']
+      '`': ['Backquote', '~', 192], '-': ['Minus', '_', 189], '=': ['Equal', '+', 187],
+      '[': ['BracketLeft', '{', 219], ']': ['BracketRight', '}', 221], '\\': ['Backslash', '|', 220],
+      ';': ['Semicolon', ':', 186], "'": ['Quote', '"', 222], ',': ['Comma', '<', 188],
+      '.': ['Period', '>', 190], '/': ['Slash', '?', 191], ' ': ['Space', ' ', 32]
     };
     const DIGIT_SHIFTED = ')!@#$%^&*(';
 
@@ -3062,12 +3066,12 @@ class UnifiedBackend {
       shift = true;
     } else if (KEY_LAYOUT[char]) {
       code = KEY_LAYOUT[char][0];
-      virtualKeyCode = char === ' ' ? 32 : char.charCodeAt(0);
+      virtualKeyCode = KEY_LAYOUT[char][2];
     } else {
       const unshifted = Object.keys(KEY_LAYOUT).find(k => KEY_LAYOUT[k][1] === char);
       if (unshifted) {
         code = KEY_LAYOUT[unshifted][0];
-        virtualKeyCode = unshifted.charCodeAt(0);
+        virtualKeyCode = KEY_LAYOUT[unshifted][2];
         shift = true;
       }
     }
